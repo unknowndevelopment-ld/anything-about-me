@@ -1,0 +1,8 @@
+name = "authenticated-worker-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+# Configure this in the deployment environment. An empty value intentionally
+# means that every proxy target is rejected.
+[vars]
+UPSTREAM_ALLOWLIST = ""

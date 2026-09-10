@@ -494,11 +494,11 @@ function parseCookies(request: Request): Map<string, string> {
     const index = part.indexOf("=");
     if (index > 0) {
       const name = part.slice(0, index).trim();
-      const encodedValue = part.slice(index + 1).trim();
-      // Only decode if the value is non-empty and valid base64url/URL-encoded
-      if (encodedValue) {
+      const value = part.slice(index + 1).trim();
+      // Store the decoded value as-is (already stored URL-encoded in cookie)
+      if (value) {
         try {
-          cookies.set(name, decodeURIComponent(encodedValue));
+          cookies.set(name, decodeURIComponent(value));
         } catch {
           // Ignore malformed cookie values.
         }
@@ -532,7 +532,11 @@ function constantTimeEqual(left: string, right: string): boolean {
 
 function base64UrlEncode(value: string | Uint8Array): string {
   const bytes = typeof value === "string" ? encoder.encode(value) : value;
-  return btoa(String.fromCharCode(...Array.from(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 function base64UrlDecode(value: string): Uint8Array {

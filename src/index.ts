@@ -7,7 +7,7 @@ interface Env {
 
 const SESSION_COOKIE = "proxy_session";
 const CSRF_COOKIE = "proxy_csrf";
-const SESSION_TTL_SECONDS = 60 * 60;
+const SESSION_TTL_SECONDS = 24 * 60 * 60;
 const CSRF_TTL_SECONDS = 10 * 60;
 const encoder = new TextEncoder();
 
@@ -21,31 +21,15 @@ export default {
 
     const session = await readSession(request, env.SESSION_SECRET);
     if (!session) {
-      const credentials = parseBasicAuth(request);
-      if (!credentials) {
-        return request.headers.has("Authorization")
-          ? accessDeniedResponse()
-          : basicAuthChallengeResponse();
+      if (url.pathname === "/" && request.method === "GET") {
+        return loginPageResponse();
       }
-      if (
-        !env.PROXY_USERNAME ||
-        !env.PROXY_PASSWORD ||
-        !constantTimeEqual(credentials.username, env.PROXY_USERNAME) ||
-        !constantTimeEqual(credentials.password, env.PROXY_PASSWORD)
-      ) {
-        return accessDeniedResponse();
-      }
-      const sessionToken = await createSession(credentials.username, env.SESSION_SECRET);
-      if (!sessionToken) {
-        return accessDeniedResponse();
-      }
-      return new Response(null, {
-        status: 303,
-        headers: {
-          Location: `${url.pathname}${url.search}`,
-          "Set-Cookie": serializeCookie(SESSION_COOKIE, sessionToken, SESSION_TTL_SECONDS, true),
-        },
-      });
+      return request.headers.get("Accept")?.includes("text/html")
+        ? loginPageResponse()
+        : new Response("Authentication required.", {
+            status: 401,
+            headers: { "Cache-Control": "no-store" },
+          });
     }
 
     if (url.pathname === "/logout") {
@@ -301,16 +285,6 @@ function loginPageResponse(): Response {
   });
 }
 
-function basicAuthChallengeResponse(): Response {
-  return new Response("Authentication required.", {
-    status: 401,
-    headers: {
-      "WWW-Authenticate": 'Basic realm="Authenticated Worker Proxy", charset="UTF-8"',
-      "Cache-Control": "no-store",
-    },
-  });
-}
-
 function homeResponse(request: Request): Response {
   const csrf = parseCookies(request).get(CSRF_COOKIE) ?? crypto.randomUUID();
   return new Response(homePage(csrf), {
@@ -332,12 +306,16 @@ function accessDeniedResponse(): Response {
 }
 
 function loginPage(csrf: string): string {
-  return page("Sign in", `<form method="post" action="/login">
-    <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-    <label>Username <input name="username" autocomplete="username" required></label>
-    <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
-    <button type="submit">Sign in</button>
-  </form>`);
+  return page("Sign in", `<div class="login-modal" role="dialog" aria-modal="true" aria-labelledby="login-title">
+    <h2 id="login-title">Sign in to the proxy</h2>
+    <p>Your secure session lasts 24 hours. You will be asked to sign in again after it expires or when you sign out.</p>
+    <form method="post" action="/login">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <label>Username <input name="username" autocomplete="username" required autofocus></label>
+      <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+      <button type="submit">Sign in</button>
+    </form>
+  </div>`);
 }
 
 function homePage(csrf: string): string {
@@ -443,7 +421,7 @@ function homePage(csrf: string): string {
 }
 
 function page(title: string, body: string): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px system-ui,sans-serif;margin:0;padding:1rem;color:#202124;background:#f4f6f8}main{max-width:72rem;margin:2rem auto}form{display:grid;gap:1rem;margin:1rem 0}label{display:grid;gap:.35rem}input{font:inherit;padding:.55rem;border:1px solid #9aa0a6;border-radius:6px}button{font:inherit;padding:.55rem 1rem;width:max-content;border:1px solid #8a929a;border-radius:6px;background:#fff;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}a{color:#075985}.browser{display:grid;grid-template-rows:auto auto auto minmax(28rem,70vh);background:#fff;border:1px solid #c7cdd3;border-radius:10px;overflow:hidden;box-shadow:0 3px 14px #0001}.toolbar{display:flex;gap:.45rem;align-items:center;padding:.65rem;background:#e9edf1;border-bottom:1px solid #c7cdd3}.icon-button{font-size:1.1rem;padding:.35rem .65rem}.address-form{display:flex;flex:1;gap:.45rem;margin:0}.address-form input{flex:1;min-width:0}.address-form button{padding:.35rem .8rem}.tabs{display:flex;gap:.2rem;align-items:end;padding:.35rem .5rem 0;background:#dfe4e8;overflow-x:auto}.tab{max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:7px 7px 0 0;border-bottom:0}.tab.active{background:#fff}.new-tab{padding:.35rem .7rem;border:0;background:transparent}.browser-status{padding:.35rem .75rem;color:#5f6368;font-size:.85rem;border-bottom:1px solid #d8dde2}.browser iframe{border:0;width:100%;height:100%;background:#fff}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}</style></head><body><main><h1>${escapeHtml(title)}</h1>${body}</main></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px system-ui,sans-serif;margin:0;padding:1rem;color:#202124;background:#f4f6f8}main{max-width:72rem;margin:2rem auto}form{display:grid;gap:1rem;margin:1rem 0}label{display:grid;gap:.35rem}input{font:inherit;padding:.55rem;border:1px solid #9aa0a6;border-radius:6px}button{font:inherit;padding:.55rem 1rem;width:max-content;border:1px solid #8a929a;border-radius:6px;background:#fff;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}a{color:#075985}.login-modal{max-width:28rem;margin:10vh auto;padding:2rem;background:#fff;border:1px solid #c7cdd3;border-radius:10px;box-shadow:0 8px 28px #0002}.login-modal h2{margin-top:0}.browser{display:grid;grid-template-rows:auto auto auto minmax(28rem,70vh);background:#fff;border:1px solid #c7cdd3;border-radius:10px;overflow:hidden;box-shadow:0 3px 14px #0001}.toolbar{display:flex;gap:.45rem;align-items:center;padding:.65rem;background:#e9edf1;border-bottom:1px solid #c7cdd3}.icon-button{font-size:1.1rem;padding:.35rem .65rem}.address-form{display:flex;flex:1;gap:.45rem;margin:0}.address-form input{flex:1;min-width:0}.address-form button{padding:.35rem .8rem}.tabs{display:flex;gap:.2rem;align-items:end;padding:.35rem .5rem 0;background:#dfe4e8;overflow-x:auto}.tab{max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:7px 7px 0 0;border-bottom:0}.tab.active{background:#fff}.new-tab{padding:.35rem .7rem;border:0;background:transparent}.browser-status{padding:.35rem .75rem;color:#5f6368;font-size:.85rem;border-bottom:1px solid #d8dde2}.browser iframe{border:0;width:100%;height:100%;background:#fff}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}</style></head><body><main><h1>${escapeHtml(title)}</h1>${body}</main></body></html>`;
 }
 
 function parseCookies(request: Request): Map<string, string> {
@@ -459,32 +437,6 @@ function parseCookies(request: Request): Map<string, string> {
     }
   }
   return cookies;
-}
-
-function parseBasicAuth(request: Request): { username: string; password: string } | null {
-  const header = request.headers.get("Authorization");
-  if (!header) {
-    return null;
-  }
-  const match = header.match(/^Basic[ \t]+([A-Za-z0-9+/]+={0,2})[ \t]*$/i);
-  if (!match) {
-    return null;
-  }
-  try {
-    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(
-      Uint8Array.from(atob(match[1]), (character) => character.charCodeAt(0)),
-    );
-    const separator = decoded.indexOf(":");
-    if (separator < 1) {
-      return null;
-    }
-    return {
-      username: decoded.slice(0, separator),
-      password: decoded.slice(separator + 1),
-    };
-  } catch {
-    return null;
-  }
 }
 
 function serializeCookie(name: string, value: string, maxAge: number, httpOnly: boolean): string {
@@ -518,4 +470,4 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character] ?? character);
 }
 
-export { validateTarget, isBlockedHostname, parseBasicAuth, accessDeniedResponse, basicAuthChallengeResponse };
+export { validateTarget, isBlockedHostname, accessDeniedResponse };

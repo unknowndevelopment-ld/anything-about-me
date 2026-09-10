@@ -1,11 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  accessDeniedResponse,
-  basicAuthChallengeResponse,
-  isBlockedHostname,
-  parseBasicAuth,
-  validateTarget,
-} from "../src/index";
+import { accessDeniedResponse, isBlockedHostname, validateTarget } from "../src/index";
 
 describe("proxy target validation", () => {
   it("requires an explicit allowlist entry", () => {
@@ -22,22 +16,7 @@ describe("proxy target validation", () => {
     expect(isBlockedHostname("169.254.169.254")).toBe(true);
   });
 
-  it("parses standard Basic Auth credentials without logging or decoding loosely", () => {
-    const request = new Request("https://proxy.example/", {
-      headers: { Authorization: `Basic ${btoa("alice:s3cret:with-colon")}` },
-    });
-    expect(parseBasicAuth(request)).toEqual({ username: "alice", password: "s3cret:with-colon" });
-    expect(parseBasicAuth(new Request("https://proxy.example/"))).toBeNull();
-    expect(
-      parseBasicAuth(new Request("https://proxy.example/", { headers: { Authorization: "Bearer token" } })),
-    ).toBeNull();
-  });
-
-  it("keeps the browser challenge separate from invalid-credential denial", async () => {
-    const challenge = basicAuthChallengeResponse();
-    expect(challenge.status).toBe(401);
-    expect(challenge.headers.get("WWW-Authenticate")).toContain("Basic realm=");
-
+  it("returns a plain denial for invalid credentials", async () => {
     const denied = accessDeniedResponse();
     expect(denied.status).toBe(403);
     expect(denied.headers.get("Content-Type")).toContain("text/plain");

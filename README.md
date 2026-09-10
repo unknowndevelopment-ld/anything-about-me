@@ -4,7 +4,7 @@ This Worker exposes a deliberately restricted `GET /proxy?url=...` endpoint. Eve
 
 After sign-in, the Worker serves a regular-browser UI with tabs, an address bar, back/forward controls, refresh, and sign-out. Each tab loads through the authenticated `/proxy` endpoint in an isolated iframe; upstream redirects are revalidated and routed back through the proxy.
 
-The first request uses HTTP Basic Auth, so Chrome and other browsers show their native username/password dialog. Enter the values stored in `PROXY_USERNAME` and `PROXY_PASSWORD`. A successful challenge response is exchanged for the existing signed, expiring session cookie; the Basic Auth header is not logged or forwarded upstream. If the header is absent, the Worker returns `401` with `WWW-Authenticate`; malformed or incorrect credentials receive a plain `403 Access Denied` response. The legacy CSRF-protected form remains available at `/login`.
+Unauthenticated browser requests show an in-page login modal. Enter the values stored in `PROXY_USERNAME` and `PROXY_PASSWORD`; a successful CSRF-protected submission creates a signed, HttpOnly, Secure, SameSite session cookie valid for exactly 24 hours. After expiry, deletion, or sign-out, the next navigation, tab reload, or proxy request requires the modal again. Invalid credentials receive a plain `403 Access Denied` response.
 
 ## Deploy
 
@@ -44,7 +44,7 @@ npm test
 npx wrangler dev
 ```
 
-The login form uses Worker secrets, signed one-hour session cookies, `Secure`/`HttpOnly`/`SameSite=Strict` cookie attributes, and a CSRF token. The Worker never imitates a Cloudflare error page.
+The login form uses Worker secrets, signed 24-hour session cookies, `Secure`/`HttpOnly`/`SameSite=Strict` cookie attributes, and a CSRF token. The Worker never imitates a Cloudflare error page.
 
 ## Authentication troubleshooting
 
@@ -58,4 +58,4 @@ npx wrangler secret put SESSION_SECRET
 npx wrangler deploy
 ```
 
-Paste the secret values exactly when prompted: do not include surrounding quotes or a trailing newline. `SESSION_SECRET` must be present as well as the username and password, because it signs the session cookie after Basic Auth succeeds. If Chrome has cached a failed Basic Auth credential, retry in an incognito window or clear the saved credential for the Worker origin. A request with no `Authorization` header should be `401` with `WWW-Authenticate`; a request with a supplied but wrong or malformed header should be plain `403`. Never commit `.env` files or credentials.
+Paste the secret values exactly when prompted: do not include surrounding quotes or a trailing newline. `SESSION_SECRET` must be present as well as the username and password, because it signs and verifies the 24-hour session cookie. Never commit `.env` files or credentials.

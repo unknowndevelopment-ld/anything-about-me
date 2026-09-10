@@ -58,4 +58,4 @@ npx wrangler secret put SESSION_SECRET
 npx wrangler deploy
 ```
 
-Paste the secret values exactly when prompted: do not include surrounding quotes or a trailing newline. `SESSION_SECRET` must be present as well as the username and password, because it signs and verifies the 24-hour session cookie. Never commit `.env` files or credentials.
+Paste the secret values exactly when prompted: do not include surrounding quotes or a trailing newline. `SESSION_SECRET` must be present as well as the username and password, because it signs and verifies the 24-hour session cookie. The Worker sets `Secure` on CSRF and session cookies whenever the request uses HTTPS; use HTTPS for production. This also allows local HTTP development to complete the login flow without a browser dropping the cookies. Never commit `.env` files or credentials.

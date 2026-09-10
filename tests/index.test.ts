@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accessDeniedResponse, isBlockedHostname, validateTarget } from "../src/index";
+import { accessDeniedResponse, isBlockedHostname, serializeCookie, validateTarget } from "../src/index";
 
 describe("proxy target validation", () => {
   it("requires an explicit allowlist entry", () => {
@@ -21,5 +21,14 @@ describe("proxy target validation", () => {
     expect(denied.status).toBe(403);
     expect(denied.headers.get("Content-Type")).toContain("text/plain");
     expect(await denied.text()).toBe("403 Access Denied");
+  });
+
+  it("only marks cookies Secure when the Worker request is HTTPS", () => {
+    expect(serializeCookie("session", "value", 60, true, new Request("http://localhost/"))).not.toContain(
+      "; Secure",
+    );
+    expect(serializeCookie("session", "value", 60, true, new Request("https://proxy.example/"))).toContain(
+      "; Secure",
+    );
   });
 });

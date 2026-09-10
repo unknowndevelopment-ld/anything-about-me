@@ -22,10 +22,10 @@ export default {
     const session = await readSession(request, env.SESSION_SECRET);
     if (!session) {
       if (url.pathname === "/" && request.method === "GET") {
-        return loginPageResponse();
+        return loginPageResponse(request);
       }
       return request.headers.get("Accept")?.includes("text/html")
-        ? loginPageResponse()
+        ? loginPageResponse(request)
         : new Response("Authentication required.", {
             status: 401,
             headers: { "Cache-Control": "no-store" },
@@ -50,7 +50,7 @@ export default {
 
 async function handleLogin(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET") {
-    return loginPageResponse();
+    return loginPageResponse(request);
   }
   if (request.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
@@ -85,7 +85,7 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
     status: 303,
     headers: {
       Location: "/",
-      "Set-Cookie": serializeCookie(SESSION_COOKIE, session, SESSION_TTL_SECONDS, true),
+      "Set-Cookie": serializeCookie(SESSION_COOKIE, session, SESSION_TTL_SECONDS, true, request),
     },
   });
 }
@@ -106,7 +106,7 @@ async function handleLogout(request: Request): Promise<Response> {
     status: 303,
     headers: {
       Location: "/login",
-      "Set-Cookie": serializeCookie(SESSION_COOKIE, "", 0, true),
+      "Set-Cookie": serializeCookie(SESSION_COOKIE, "", 0, true, request),
     },
   });
 }
@@ -273,14 +273,14 @@ async function sign(value: string, secret: string): Promise<string> {
   return base64UrlEncode(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(value))));
 }
 
-function loginPageResponse(): Response {
+function loginPageResponse(request: Request): Response {
   const csrf = crypto.randomUUID();
   return new Response(loginPage(csrf), {
     status: 200,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
-      "Set-Cookie": serializeCookie(CSRF_COOKIE, csrf, CSRF_TTL_SECONDS, false),
+      "Set-Cookie": serializeCookie(CSRF_COOKIE, csrf, CSRF_TTL_SECONDS, false, request),
     },
   });
 }
@@ -293,7 +293,7 @@ function homeResponse(request: Request): Response {
       "Cache-Control": "no-store",
       ...(parseCookies(request).has(CSRF_COOKIE)
         ? {}
-        : { "Set-Cookie": serializeCookie(CSRF_COOKIE, csrf, CSRF_TTL_SECONDS, false) }),
+        : { "Set-Cookie": serializeCookie(CSRF_COOKIE, csrf, CSRF_TTL_SECONDS, false, request) }),
     },
   });
 }
@@ -439,8 +439,15 @@ function parseCookies(request: Request): Map<string, string> {
   return cookies;
 }
 
-function serializeCookie(name: string, value: string, maxAge: number, httpOnly: boolean): string {
-  return `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}; Secure; SameSite=Strict${httpOnly ? "; HttpOnly" : ""}`;
+function serializeCookie(
+  name: string,
+  value: string,
+  maxAge: number,
+  httpOnly: boolean,
+  request: Request,
+): string {
+  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
+  return `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}${secure}; SameSite=Strict${httpOnly ? "; HttpOnly" : ""}`;
 }
 
 function constantTimeEqual(left: string, right: string): boolean {
@@ -470,4 +477,4 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character] ?? character);
 }
 
-export { validateTarget, isBlockedHostname, accessDeniedResponse };
+export { validateTarget, isBlockedHostname, accessDeniedResponse, serializeCookie };

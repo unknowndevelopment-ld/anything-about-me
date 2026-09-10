@@ -135,7 +135,7 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
 
   const validatedTarget = validateTarget(target, env.UPSTREAM_ALLOWLIST);
   if (!validatedTarget) {
-    return accessDeniedResponse("The requested upstream is not allowed.");
+    return accessDeniedResponse();
   }
 
   try {
@@ -324,10 +324,10 @@ function homeResponse(request: Request): Response {
   });
 }
 
-function accessDeniedResponse(message = "Your credentials were missing or invalid."): Response {
-  return new Response(page("403 Access Denied", `<p>${escapeHtml(message)}</p><p><a href="/login">Return to sign in</a></p>`), {
+function accessDeniedResponse(): Response {
+  return new Response("403 Access Denied", {
     status: 403,
-    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
   });
 }
 
@@ -466,7 +466,7 @@ function parseBasicAuth(request: Request): { username: string; password: string 
   if (!header) {
     return null;
   }
-  const match = header.match(/^Basic[ \t]+([A-Za-z0-9+/]+={0,2})$/i);
+  const match = header.match(/^Basic[ \t]+([A-Za-z0-9+/]+={0,2})[ \t]*$/i);
   if (!match) {
     return null;
   }
@@ -518,4 +518,4 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character] ?? character);
 }
 
-export { validateTarget, isBlockedHostname, parseBasicAuth };
+export { validateTarget, isBlockedHostname, parseBasicAuth, accessDeniedResponse, basicAuthChallengeResponse };

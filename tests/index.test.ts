@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { isBlockedHostname, parseBasicAuth, validateTarget } from "../src/index";
+import {
+  accessDeniedResponse,
+  basicAuthChallengeResponse,
+  isBlockedHostname,
+  parseBasicAuth,
+  validateTarget,
+} from "../src/index";
 
 describe("proxy target validation", () => {
   it("requires an explicit allowlist entry", () => {
@@ -25,5 +31,16 @@ describe("proxy target validation", () => {
     expect(
       parseBasicAuth(new Request("https://proxy.example/", { headers: { Authorization: "Bearer token" } })),
     ).toBeNull();
+  });
+
+  it("keeps the browser challenge separate from invalid-credential denial", async () => {
+    const challenge = basicAuthChallengeResponse();
+    expect(challenge.status).toBe(401);
+    expect(challenge.headers.get("WWW-Authenticate")).toContain("Basic realm=");
+
+    const denied = accessDeniedResponse();
+    expect(denied.status).toBe(403);
+    expect(denied.headers.get("Content-Type")).toContain("text/plain");
+    expect(await denied.text()).toBe("403 Access Denied");
   });
 });

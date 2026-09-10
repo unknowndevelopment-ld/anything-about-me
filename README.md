@@ -4,6 +4,8 @@ This Worker exposes a deliberately restricted `GET /proxy?url=...` endpoint. Eve
 
 After sign-in, the Worker serves a regular-browser UI with tabs, an address bar, back/forward controls, refresh, and sign-out. Each tab loads through the authenticated `/proxy` endpoint in an isolated iframe; upstream redirects are revalidated and routed back through the proxy.
 
+The first request uses HTTP Basic Auth, so Chrome and other browsers show their native username/password dialog. Enter the values stored in `PROXY_USERNAME` and `PROXY_PASSWORD`. A successful challenge response is exchanged for the existing signed, expiring session cookie; the Basic Auth header is not logged or forwarded upstream. If the header is absent, the Worker returns `401` with `WWW-Authenticate`; malformed or incorrect credentials receive the branded `403 Access Denied` page. The legacy CSRF-protected form remains available at `/login`.
+
 ## Deploy
 
 Install dependencies and authenticate Wrangler:

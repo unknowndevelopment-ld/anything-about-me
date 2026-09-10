@@ -21,10 +21,31 @@ export default {
 
     const session = await readSession(request, env.SESSION_SECRET);
     if (!session) {
-      if (url.pathname === "/" && request.method === "GET") {
-        return loginPageResponse();
+      const credentials = parseBasicAuth(request);
+      if (!credentials) {
+        return request.headers.has("Authorization")
+          ? accessDeniedResponse()
+          : basicAuthChallengeResponse();
       }
-      return accessDeniedResponse();
+      if (
+        !env.PROXY_USERNAME ||
+        !env.PROXY_PASSWORD ||
+        !constantTimeEqual(credentials.username, env.PROXY_USERNAME) ||
+        !constantTimeEqual(credentials.password, env.PROXY_PASSWORD)
+      ) {
+        return accessDeniedResponse();
+      }
+      const sessionToken = await createSession(credentials.username, env.SESSION_SECRET);
+      if (!sessionToken) {
+        return accessDeniedResponse();
+      }
+      return new Response(null, {
+        status: 303,
+        headers: {
+          Location: `${url.pathname}${url.search}`,
+          "Set-Cookie": serializeCookie(SESSION_COOKIE, sessionToken, SESSION_TTL_SECONDS, true),
+        },
+      });
     }
 
     if (url.pathname === "/logout") {
@@ -280,6 +301,16 @@ function loginPageResponse(): Response {
   });
 }
 
+function basicAuthChallengeResponse(): Response {
+  return new Response("Authentication required.", {
+    status: 401,
+    headers: {
+      "WWW-Authenticate": 'Basic realm="Authenticated Worker Proxy", charset="UTF-8"',
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
 function homeResponse(request: Request): Response {
   const csrf = parseCookies(request).get(CSRF_COOKIE) ?? crypto.randomUUID();
   return new Response(homePage(csrf), {
@@ -430,6 +461,32 @@ function parseCookies(request: Request): Map<string, string> {
   return cookies;
 }
 
+function parseBasicAuth(request: Request): { username: string; password: string } | null {
+  const header = request.headers.get("Authorization");
+  if (!header) {
+    return null;
+  }
+  const match = header.match(/^Basic[ \t]+([A-Za-z0-9+/]+={0,2})$/i);
+  if (!match) {
+    return null;
+  }
+  try {
+    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(
+      Uint8Array.from(atob(match[1]), (character) => character.charCodeAt(0)),
+    );
+    const separator = decoded.indexOf(":");
+    if (separator < 1) {
+      return null;
+    }
+    return {
+      username: decoded.slice(0, separator),
+      password: decoded.slice(separator + 1),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function serializeCookie(name: string, value: string, maxAge: number, httpOnly: boolean): string {
   return `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}; Secure; SameSite=Strict${httpOnly ? "; HttpOnly" : ""}`;
 }
@@ -461,4 +518,4 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character] ?? character);
 }
 
-export { validateTarget, isBlockedHostname };
+export { validateTarget, isBlockedHostname, parseBasicAuth };

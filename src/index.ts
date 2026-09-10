@@ -21,6 +21,30 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // Diagnostic endpoint to check environment setup
+    if (url.pathname === "/.well-known/config" && request.method === "GET") {
+      const hasUsername = !!env.PROXY_USERNAME;
+      const hasPassword = !!env.PROXY_PASSWORD;
+      const hasSecret = !!env.SESSION_SECRET;
+      const hasAllowlist = !!env.UPSTREAM_ALLOWLIST;
+      return new Response(
+        JSON.stringify({
+          status: "environment_check",
+          configured: {
+            PROXY_USERNAME: hasUsername,
+            PROXY_PASSWORD: hasPassword,
+            SESSION_SECRET: hasSecret,
+            UPSTREAM_ALLOWLIST: hasAllowlist,
+          },
+          message: hasUsername && hasPassword && hasSecret ? "All required variables are set" : "Missing required environment variables",
+        }, null, 2),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+
     if (url.pathname === "/login") {
       return handleLogin(request, env);
     }
@@ -28,10 +52,10 @@ export default {
     const session = await readSession(request, env.SESSION_SECRET);
     if (!session) {
       if (url.pathname === "/" && request.method === "GET") {
-        return loginPageResponse(request);
+        return loginPageResponse(request, env);
       }
       return request.headers.get("Accept")?.includes("text/html")
-        ? loginPageResponse(request)
+        ? loginPageResponse(request, env)
         : new Response("Authentication required.", {
             status: 401,
             headers: { "Cache-Control": "no-store" },
@@ -55,8 +79,17 @@ export default {
 };
 
 async function handleLogin(request: Request, env: Env): Promise<Response> {
+  // Check if environment variables are set
+  if (!env.PROXY_USERNAME || !env.PROXY_PASSWORD || !env.SESSION_SECRET) {
+    return new Response(
+      "ERROR: Worker is not configured. Missing PROXY_USERNAME, PROXY_PASSWORD, or SESSION_SECRET secrets. " +
+      "Run: npx wrangler secret put PROXY_USERNAME && npx wrangler secret put PROXY_PASSWORD && npx wrangler secret put SESSION_SECRET",
+      { status: 503, headers: { "Content-Type": "text/plain" } }
+    );
+  }
+
   if (request.method === "GET") {
-    return loginPageResponse(request);
+    return loginPageResponse(request, env);
   }
   if (request.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
@@ -75,8 +108,6 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
     !constantTimeEqual(csrfCookie, csrfForm) ||
     typeof username !== "string" ||
     typeof password !== "string" ||
-    !env.PROXY_USERNAME ||
-    !env.PROXY_PASSWORD ||
     !constantTimeEqual(username, env.PROXY_USERNAME) ||
     !constantTimeEqual(password, env.PROXY_PASSWORD)
   ) {
@@ -324,9 +355,9 @@ async function sign(value: string, secret: string): Promise<string> {
   return base64UrlEncode(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(value))));
 }
 
-function loginPageResponse(request: Request): Response {
+function loginPageResponse(request: Request, env: Env): Response {
   const csrf = crypto.randomUUID();
-  return new Response(loginPage(csrf), {
+  return new Response(loginPage(csrf, env), {
     status: 200,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
@@ -357,8 +388,12 @@ function accessDeniedResponse(): Response {
   });
 }
 
-function loginPage(csrf: string): string {
-  return page("Sign in", `<div class="login-modal" role="dialog" aria-modal="true" aria-labelledby="login-title">
+function loginPage(csrf: string, env: Env): string {
+  const envStatus = !env.PROXY_USERNAME || !env.PROXY_PASSWORD || !env.SESSION_SECRET
+    ? `<div style="background:#f8d7da;border:1px solid #f5c6cb;color:#721c24;padding:12px;margin-bottom:16px;border-radius:4px;"><strong>⚠️ Configuration Error:</strong> Missing environment secrets. Set them with: <code>npx wrangler secret put PROXY_USERNAME</code>, <code>npx wrangler secret put PROXY_PASSWORD</code>, <code>npx wrangler secret put SESSION_SECRET</code></div>`
+    : "";
+
+  return page("Sign in", `${envStatus}<div class="login-modal" role="dialog" aria-modal="true" aria-labelledby="login-title">
     <h2 id="login-title">Sign in to the proxy</h2>
     <p>Your secure session lasts 24 hours. You will be asked to sign in again after it expires or when you sign out.</p>
     <form method="post" action="/login">
@@ -480,7 +515,7 @@ function homePage(csrf: string): string {
 }
 
 function page(title: string, body: string): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px system-ui,sans-serif;margin:0;padding:16px;background:#f5f5f5}.login-modal{background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);padding:32px;max-width:400px;margin:0 auto}h2{margin-top:0}.browser{display:flex;flex-direction:column;height:100vh;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);overflow:hidden}.toolbar{display:flex;align-items:center;gap:8px;padding:8px;background:#f0f0f0;border-bottom:1px solid #ddd}.icon-button{padding:8px;background:white;border:1px solid #ddd;border-radius:4px;cursor:pointer}.icon-button:hover{background:#f9f9f9}.address-form{display:flex;flex:1;gap:8px}#address{flex:1;padding:8px;border:1px solid #ddd;border-radius:4px;font-family:monospace}.tabs{display:flex;gap:4px;padding:8px;background:#f9f9f9;border-bottom:1px solid #ddd;align-items:center;overflow-x:auto}.tab{padding:8px 12px;background:white;border:1px solid #ddd;border-radius:4px 4px 0 0;cursor:pointer}.tab.active{background:white;border-bottom-color:white;font-weight:bold}.new-tab{padding:8px 12px;background:white;border:1px solid #ddd;border-radius:4px;cursor:pointer}.browser-status{padding:8px 16px;background:#fff3cd;border-bottom:1px solid #ffc107;font-size:14px}#viewport{flex:1;border:none;width:100%}label{display:block;margin:16px 0}input{width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:16px;box-sizing:border-box}button[type=submit]{padding:8px 16px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer}button[type=submit]:hover{background:#0056b3}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}</style></head><body>${body}</body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px system-ui,sans-serif;margin:0;padding:16px;background:#f5f5f5}.login-modal{background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);padding:32px;max-width:400px;margin:0 auto}h2{margin-top:0}.browser{display:flex;flex-direction:column;height:100vh;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);overflow:hidden}.toolbar{display:flex;align-items:center;gap:8px;padding:8px;background:#f0f0f0;border-bottom:1px solid #ddd}.icon-button{padding:8px;background:white;border:1px solid #ddd;border-radius:4px;cursor:pointer}.icon-button:hover{background:#f9f9f9}.address-form{display:flex;flex:1;gap:8px}#address{flex:1;padding:8px;border:1px solid #ddd;border-radius:4px;font-family:monospace}.tabs{display:flex;gap:4px;padding:8px;background:#f9f9f9;border-bottom:1px solid #ddd;align-items:center;overflow-x:auto}.tab{padding:8px 12px;background:white;border:1px solid #ddd;border-radius:4px 4px 0 0;cursor:pointer}.tab.active{background:white;border-bottom-color:white;font-weight:bold}.new-tab{padding:8px 12px;background:white;border:1px solid #ddd;border-radius:4px;cursor:pointer}.browser-status{padding:8px 16px;background:#fff3cd;border-bottom:1px solid #ffc107;font-size:14px}#viewport{flex:1;border:none;width:100%}label{display:block;margin:16px 0}input{width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:16px;box-sizing:border-box}button[type=submit]{padding:8px 16px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer}button[type=submit]:hover{background:#0056b3}code{background:#f4f4f4;padding:2px 6px;border-radius:3px;font-family:monospace;font-size:12px}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}</style></head><body>${body}</body></html>`;
 }
 
 function parseCookies(request: Request): Map<string, string> {

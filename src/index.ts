@@ -11,6 +11,12 @@ const SESSION_TTL_SECONDS = 24 * 60 * 60;
 const CSRF_TTL_SECONDS = 10 * 60;
 const encoder = new TextEncoder();
 
+// Cache for parsed allowlists to avoid re-parsing on every request
+const allowlistCache = new Map<string, URL[]>();
+
+// Cache for HMAC keys to avoid re-importing on every signature operation
+const keyCache = new Map<string, CryptoKey>();
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -57,7 +63,8 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
   }
 
   const form = await request.formData();
-  const csrfCookie = parseCookies(request).get(CSRF_COOKIE);
+  const cookies = parseCookies(request);
+  const csrfCookie = cookies.get(CSRF_COOKIE);
   const csrfForm = form.get("csrf");
   const username = form.get("username");
   const password = form.get("password");
@@ -96,7 +103,8 @@ async function handleLogout(request: Request): Promise<Response> {
   }
 
   const form = await request.formData();
-  const csrfCookie = parseCookies(request).get(CSRF_COOKIE);
+  const cookies = parseCookies(request);
+  const csrfCookie = cookies.get(CSRF_COOKIE);
   const csrfForm = form.get("csrf");
   if (!csrfCookie || typeof csrfForm !== "string" || !constantTimeEqual(csrfCookie, csrfForm)) {
     return accessDeniedResponse();
@@ -155,6 +163,27 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
   }
 }
 
+function parseAllowlist(allowlist: string): URL[] {
+  if (allowlistCache.has(allowlist)) {
+    return allowlistCache.get(allowlist)!;
+  }
+
+  const entries: URL[] = [];
+  for (const entry of allowlist.split(/[\n,]/)) {
+    const trimmed = entry.trim();
+    if (trimmed) {
+      try {
+        entries.push(new URL(trimmed));
+      } catch {
+        // Invalid allowlist entries do not grant access.
+      }
+    }
+  }
+
+  allowlistCache.set(allowlist, entries);
+  return entries;
+}
+
 function validateTarget(rawTarget: string, allowlist: string): string | null {
   let target: URL;
   try {
@@ -173,24 +202,16 @@ function validateTarget(rawTarget: string, allowlist: string): string | null {
     return null;
   }
 
-  const entries = allowlist
-    .split(/[\n,]/)
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  for (const entry of entries) {
-    try {
-      const allowed = new URL(entry);
-      if (
-        allowed.protocol === target.protocol &&
-        allowed.hostname === target.hostname &&
-        allowed.port === target.port &&
-        (target.pathname === allowed.pathname ||
-          target.pathname.startsWith(allowed.pathname.endsWith("/") ? allowed.pathname : `${allowed.pathname}/`))
-      ) {
-        return target.toString();
-      }
-    } catch {
-      // Invalid allowlist entries do not grant access.
+  const entries = parseAllowlist(allowlist);
+  for (const allowed of entries) {
+    if (
+      allowed.protocol === target.protocol &&
+      allowed.hostname === target.hostname &&
+      allowed.port === target.port &&
+      (target.pathname === allowed.pathname ||
+        target.pathname.startsWith(allowed.pathname.endsWith("/") ? allowed.pathname : `${allowed.pathname}/`))
+    ) {
+      return target.toString();
     }
   }
   return null;
@@ -198,6 +219,8 @@ function validateTarget(rawTarget: string, allowlist: string): string | null {
 
 function isBlockedHostname(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  
+  // Check reserved hostnames
   if (
     host === "localhost" ||
     host.endsWith(".localhost") ||
@@ -208,21 +231,37 @@ function isBlockedHostname(hostname: string): boolean {
     return true;
   }
 
-  const ipv4 = host.match(/^\d{1,3}(?:\.\d{1,3}){3}$/);
-  if (!ipv4) {
-    return host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:");
-  }
-  const octets = host.split(".").map(Number);
-  if (octets.some((octet) => octet > 255)) {
+  // Check IPv6 loopback and link-local
+  if (host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:")) {
     return true;
   }
-  return (
-    octets[0] === 10 ||
-    octets[0] === 127 ||
-    (octets[0] === 169 && octets[1] === 254) ||
-    (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
-    (octets[0] === 192 && octets[1] === 168)
-  );
+
+  // Try to parse as IPv4
+  const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4Match) {
+    const octets = [
+      parseInt(ipv4Match[1], 10),
+      parseInt(ipv4Match[2], 10),
+      parseInt(ipv4Match[3], 10),
+      parseInt(ipv4Match[4], 10),
+    ];
+
+    // Validate octet range
+    if (octets.some((octet) => octet > 255)) {
+      return true;
+    }
+
+    // Check reserved IPv4 ranges
+    return (
+      octets[0] === 10 ||
+      octets[0] === 127 ||
+      (octets[0] === 169 && octets[1] === 254) ||
+      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+      (octets[0] === 192 && octets[1] === 168)
+    );
+  }
+
+  return false;
 }
 
 async function createSession(username: string, secret: string): Promise<string | null> {
@@ -235,7 +274,8 @@ async function createSession(username: string, secret: string): Promise<string |
 }
 
 async function readSession(request: Request, secret: string): Promise<{ username: string } | null> {
-  const value = parseCookies(request).get(SESSION_COOKIE);
+  const cookies = parseCookies(request);
+  const value = cookies.get(SESSION_COOKIE);
   if (!value || !secret) {
     return null;
   }
@@ -262,7 +302,11 @@ async function readSession(request: Request, secret: string): Promise<{ username
   }
 }
 
-async function sign(value: string, secret: string): Promise<string> {
+async function getSigningKey(secret: string): Promise<CryptoKey> {
+  if (keyCache.has(secret)) {
+    return keyCache.get(secret)!;
+  }
+
   const key = await crypto.subtle.importKey(
     "raw",
     encoder.encode(secret),
@@ -270,6 +314,13 @@ async function sign(value: string, secret: string): Promise<string> {
     false,
     ["sign"],
   );
+
+  keyCache.set(secret, key);
+  return key;
+}
+
+async function sign(value: string, secret: string): Promise<string> {
+  const key = await getSigningKey(secret);
   return base64UrlEncode(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(value))));
 }
 
@@ -286,12 +337,13 @@ function loginPageResponse(request: Request): Response {
 }
 
 function homeResponse(request: Request): Response {
-  const csrf = parseCookies(request).get(CSRF_COOKIE) ?? crypto.randomUUID();
+  const cookies = parseCookies(request);
+  const csrf = cookies.get(CSRF_COOKIE) ?? crypto.randomUUID();
   return new Response(homePage(csrf), {
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
-      ...(parseCookies(request).has(CSRF_COOKIE)
+      ...(cookies.has(CSRF_COOKIE)
         ? {}
         : { "Set-Cookie": serializeCookie(CSRF_COOKIE, csrf, CSRF_TTL_SECONDS, false, request) }),
     },
@@ -350,9 +402,12 @@ function homePage(csrf: string): string {
     const refresh = document.getElementById('refresh');
     const newTab = document.getElementById('new-tab');
 
-    function renderTabs() {
-      tabBar.querySelectorAll('[data-tab]').forEach((element) => element.remove());
-      tabs.forEach((tab, index) => {
+    function updateTabButton(index, tab) {
+      const existingButton = tabBar.querySelector(\`[data-tab="\${index}"]\`);
+      if (existingButton) {
+        existingButton.className = index === active ? 'tab active' : 'tab';
+        existingButton.textContent = tab.title || 'New tab';
+      } else {
         const button = document.createElement('button');
         button.type = 'button';
         button.dataset.tab = String(index);
@@ -360,7 +415,11 @@ function homePage(csrf: string): string {
         button.textContent = tab.title || 'New tab';
         button.onclick = () => selectTab(index);
         tabBar.insertBefore(button, newTab);
-      });
+      }
+    }
+
+    function renderTabs() {
+      tabs.forEach((tab, index) => updateTabButton(index, tab));
     }
 
     function selectTab(index) {
@@ -421,18 +480,28 @@ function homePage(csrf: string): string {
 }
 
 function page(title: string, body: string): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px system-ui,sans-serif;margin:0;padding:1rem;color:#202124;background:#f4f6f8}main{max-width:72rem;margin:2rem auto}form{display:grid;gap:1rem;margin:1rem 0}label{display:grid;gap:.35rem}input{font:inherit;padding:.55rem;border:1px solid #9aa0a6;border-radius:6px}button{font:inherit;padding:.55rem 1rem;width:max-content;border:1px solid #8a929a;border-radius:6px;background:#fff;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}a{color:#075985}.login-modal{max-width:28rem;margin:10vh auto;padding:2rem;background:#fff;border:1px solid #c7cdd3;border-radius:10px;box-shadow:0 8px 28px #0002}.login-modal h2{margin-top:0}.browser{display:grid;grid-template-rows:auto auto auto minmax(28rem,70vh);background:#fff;border:1px solid #c7cdd3;border-radius:10px;overflow:hidden;box-shadow:0 3px 14px #0001}.toolbar{display:flex;gap:.45rem;align-items:center;padding:.65rem;background:#e9edf1;border-bottom:1px solid #c7cdd3}.icon-button{font-size:1.1rem;padding:.35rem .65rem}.address-form{display:flex;flex:1;gap:.45rem;margin:0}.address-form input{flex:1;min-width:0}.address-form button{padding:.35rem .8rem}.tabs{display:flex;gap:.2rem;align-items:end;padding:.35rem .5rem 0;background:#dfe4e8;overflow-x:auto}.tab{max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:7px 7px 0 0;border-bottom:0}.tab.active{background:#fff}.new-tab{padding:.35rem .7rem;border:0;background:transparent}.browser-status{padding:.35rem .75rem;color:#5f6368;font-size:.85rem;border-bottom:1px solid #d8dde2}.browser iframe{border:0;width:100%;height:100%;background:#fff}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}</style></head><body><main><h1>${escapeHtml(title)}</h1>${body}</main></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px system-ui,sans-serif;margin:0;padding:16px;background:#f5f5f5}.login-modal{background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);padding:32px;max-width:400px;margin:0 auto}h2{margin-top:0}.browser{display:flex;flex-direction:column;height:100vh;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);overflow:hidden}.toolbar{display:flex;align-items:center;gap:8px;padding:8px;background:#f0f0f0;border-bottom:1px solid #ddd}.icon-button{padding:8px;background:white;border:1px solid #ddd;border-radius:4px;cursor:pointer}.icon-button:hover{background:#f9f9f9}.address-form{display:flex;flex:1;gap:8px}#address{flex:1;padding:8px;border:1px solid #ddd;border-radius:4px;font-family:monospace}.tabs{display:flex;gap:4px;padding:8px;background:#f9f9f9;border-bottom:1px solid #ddd;align-items:center;overflow-x:auto}.tab{padding:8px 12px;background:white;border:1px solid #ddd;border-radius:4px 4px 0 0;cursor:pointer}.tab.active{background:white;border-bottom-color:white;font-weight:bold}.new-tab{padding:8px 12px;background:white;border:1px solid #ddd;border-radius:4px;cursor:pointer}.browser-status{padding:8px 16px;background:#fff3cd;border-bottom:1px solid #ffc107;font-size:14px}#viewport{flex:1;border:none;width:100%}label{display:block;margin:16px 0}input{width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:16px;box-sizing:border-box}button[type=submit]{padding:8px 16px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer}button[type=submit]:hover{background:#0056b3}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}</style></head><body>${body}</body></html>`;
 }
 
 function parseCookies(request: Request): Map<string, string> {
   const cookies = new Map<string, string>();
-  for (const part of request.headers.get("Cookie")?.split(";") ?? []) {
+  const cookieHeader = request.headers.get("Cookie");
+  if (!cookieHeader) {
+    return cookies;
+  }
+
+  for (const part of cookieHeader.split(";")) {
     const index = part.indexOf("=");
     if (index > 0) {
-      try {
-        cookies.set(part.slice(0, index).trim(), decodeURIComponent(part.slice(index + 1).trim()));
-      } catch {
-        // Ignore malformed cookie values.
+      const name = part.slice(0, index).trim();
+      const encodedValue = part.slice(index + 1).trim();
+      // Only decode if the value is non-empty and valid base64url/URL-encoded
+      if (encodedValue) {
+        try {
+          cookies.set(name, decodeURIComponent(encodedValue));
+        } catch {
+          // Ignore malformed cookie values.
+        }
       }
     }
   }
@@ -463,9 +532,7 @@ function constantTimeEqual(left: string, right: string): boolean {
 
 function base64UrlEncode(value: string | Uint8Array): string {
   const bytes = typeof value === "string" ? encoder.encode(value) : value;
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return btoa(String.fromCharCode(...Array.from(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 function base64UrlDecode(value: string): Uint8Array {

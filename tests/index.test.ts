@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import worker, {
   accessDeniedResponse,
+  extractTargetFromPath,
   isBlockedHostname,
   resolveProxiedUrl,
   rewriteCss,
@@ -9,12 +10,23 @@ import worker, {
   validateTarget,
 } from "../src/index";
 
-describe("target validation", () => {
+describe("target validation and path extraction", () => {
   it("allows all public websites by default or when wildcard is set", () => {
     expect(validateTarget("https://api.example.test/data", "")).toBe("https://api.example.test/data");
     expect(validateTarget("https://api.example.test/data", "*")).toBe("https://api.example.test/data");
     expect(validateTarget("https://api.example.test/data", "all")).toBe("https://api.example.test/data");
     expect(validateTarget("example.com", "*")).toBe("https://example.com/");
+  });
+
+  it("extracts direct target URLs from pathnames", () => {
+    expect(extractTargetFromPath("/discord.com/login", "")).toBe("https://discord.com/login");
+    expect(extractTargetFromPath("/https://discord.com/login", "")).toBe("https://discord.com/login");
+    expect(extractTargetFromPath("/https:/discord.com/login", "")).toBe("https://discord.com/login");
+    expect(extractTargetFromPath("/en.wikipedia.org/wiki/Main_Page", "?lang=en")).toBe(
+      "https://en.wikipedia.org/wiki/Main_Page?lang=en",
+    );
+    expect(extractTargetFromPath("/login", "")).toBeNull();
+    expect(extractTargetFromPath("/logout", "")).toBeNull();
   });
 
   it("supports explicit allowlist restrictions when specified", () => {
@@ -120,4 +132,3 @@ describe("fetch handling and diagnostics", () => {
     expect(res.status).toBe(401);
   });
 });
-

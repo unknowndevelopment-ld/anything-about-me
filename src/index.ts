@@ -19,6 +19,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // 1. Diagnostic endpoint
     if (url.pathname === "/.well-known/config" && request.method === "GET") {
       const hasUsername = !!env.PROXY_USERNAME;
       const hasPassword = !!env.PROXY_PASSWORD;
@@ -49,6 +50,7 @@ export default {
       );
     }
 
+    // 2. Authentication endpoints
     if (url.pathname === "/login") {
       return handleLogin(request, env);
     }
@@ -70,17 +72,61 @@ export default {
       return handleLogout(request);
     }
 
+    // 3. Browser UI home
     if (url.pathname === "/" && request.method === "GET") {
       return homeResponse(request);
     }
 
+    // 4. Query-based Proxy endpoints (/service?url=... or /proxy?url=...)
     if (url.pathname === "/service" || url.pathname === "/proxy") {
       return handleProxy(request, env);
     }
 
+    // 5. Path-based direct routing (e.g. /discord.com/login, /https://discord.com/login, /https:/discord.com/login)
+    const directTarget = extractTargetFromPath(url.pathname, url.search);
+    if (directTarget) {
+      return fetchUpstream(request, directTarget, env);
+    }
+
+    // 6. Dynamic Asset & Fallback Routing via Referer or active target cookie
     return handleFallbackAsset(request, env);
   },
 };
+
+function extractTargetFromPath(pathname: string, search: string): string | null {
+  const cleanPath = pathname.replace(/^\/+/, "");
+  if (!cleanPath) return null;
+
+  // Pattern 1: https://... or http://...
+  if (/^https?:\/\//i.test(cleanPath)) {
+    return cleanPath + search;
+  }
+
+  // Pattern 2: https:/... or http:/... (single slash normalization)
+  if (/^https?:\/[^/]/i.test(cleanPath)) {
+    const normalized = cleanPath.replace(
+      /^https?:\//i,
+      (m) => (m.toLowerCase().startsWith("https") ? "https://" : "http://"),
+    );
+    return normalized + search;
+  }
+
+  // Pattern 3: domain.tld/path (e.g. discord.com/login, en.wikipedia.org/wiki/Main_Page)
+  const firstSlash = cleanPath.indexOf("/");
+  const hostPart = firstSlash === -1 ? cleanPath : cleanPath.slice(0, firstSlash);
+
+  if (
+    hostPart.includes(".") &&
+    !hostPart.includes(" ") &&
+    !hostPart.endsWith(".well-known") &&
+    !["login", "logout", "service", "proxy"].includes(hostPart.toLowerCase()) &&
+    /^[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$/.test(hostPart)
+  ) {
+    return `https://${cleanPath}${search}`;
+  }
+
+  return null;
+}
 
 async function handleLogin(request: Request, env: Env): Promise<Response> {
   if (!env.PROXY_USERNAME || !env.PROXY_PASSWORD || !env.SESSION_SECRET) {
@@ -163,7 +209,10 @@ async function handleFallbackAsset(request: Request, env: Env): Promise<Response
   if (referer) {
     try {
       const refUrl = new URL(referer);
-      const refTarget = refUrl.searchParams.get("url");
+      let refTarget = refUrl.searchParams.get("url");
+      if (!refTarget) {
+        refTarget = extractTargetFromPath(refUrl.pathname, refUrl.search);
+      }
       if (refTarget) {
         const resolved = new URL(url.pathname + url.search, refTarget).toString();
         return fetchUpstream(request, resolved, env);
@@ -255,12 +304,10 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
 
     const headers = new Headers(upstreamResponse.headers);
 
-    // CRITICAL: Strip compression headers because Cloudflare automatically decompresses the stream
     headers.delete("content-encoding");
     headers.delete("content-length");
     headers.delete("transfer-encoding");
 
-    // Remove security and framing headers
     headers.delete("x-frame-options");
     headers.delete("content-security-policy");
     headers.delete("content-security-policy-report-only");
@@ -391,6 +438,12 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
   const currentTarget = ${JSON.stringify(targetUrl)};
   const endpoint = '/service?url=';
 
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register = function() {
+      return Promise.reject(new Error('ServiceWorker disabled'));
+    };
+  }
+
   function toRouted(rawUrl) {
     if (!rawUrl) return rawUrl;
     const str = String(rawUrl).trim();
@@ -417,20 +470,71 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     } catch(e) {}
   }
 
-  document.addEventListener('click', function(e) {
+  function rewriteNode(node) {
+    if (!node || node.nodeType !== 1) return;
+    if (node.tagName === 'A') {
+      const h = node.getAttribute('href');
+      if (h && !h.startsWith('#') && !h.startsWith('javascript:') && !h.startsWith('/service?url=')) {
+        try {
+          const res = new URL(h, currentTarget).href;
+          node.setAttribute('href', endpoint + encodeURIComponent(res));
+          if (node.getAttribute('target') === '_top' || node.getAttribute('target') === '_parent') {
+            node.setAttribute('target', '_self');
+          }
+        } catch(e) {}
+      }
+    } else if (node.tagName === 'FORM') {
+      const a = node.getAttribute('action');
+      if (a && !a.startsWith('/service?url=')) {
+        try {
+          const res = new URL(a, currentTarget).href;
+          node.setAttribute('action', endpoint + encodeURIComponent(res));
+        } catch(e) {}
+      }
+    }
+  }
+
+  try {
+    const observer = new MutationObserver(function(mutations) {
+      for (let i = 0; i < mutations.length; i++) {
+        const added = mutations[i].addedNodes;
+        for (let j = 0; j < added.length; j++) {
+          const n = added[j];
+          if (n.nodeType === 1) {
+            rewriteNode(n);
+            const children = n.querySelectorAll ? n.querySelectorAll('a, form') : [];
+            for (let k = 0; k < children.length; k++) {
+              rewriteNode(children[k]);
+            }
+          }
+        }
+      }
+    });
+    observer.observe(document.documentElement || document, { childList: true, subtree: true });
+  } catch(e) {}
+
+  window.addEventListener('click', function(e) {
     let el = e.target;
     while (el && el.tagName !== 'A') {
       el = el.parentElement;
     }
     if (!el) return;
-    const href = el.getAttribute('href');
-    if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+
+    let href = el.getAttribute('href') || el.href;
+    if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:')) return;
 
     e.preventDefault();
     e.stopPropagation();
 
     try {
-      const resolved = new URL(href, currentTarget).href;
+      let resolved;
+      if (href.includes('/service?url=') || href.includes('/proxy?url=')) {
+        const match = href.match(/[?&]url=([^&]+)/);
+        resolved = match ? decodeURIComponent(match[1]) : href;
+      } else {
+        resolved = new URL(href, currentTarget).href;
+      }
+
       const targetAttr = el.getAttribute('target');
       if (targetAttr === '_blank' && window.parent && window.parent !== window) {
         window.parent.postMessage({ type: 'client_open_tab', url: resolved }, '*');
@@ -465,6 +569,31 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
       return origOpen.apply(window, arguments);
     }
   };
+
+  try {
+    const origAssign = window.location.assign;
+    if (origAssign) {
+      window.location.assign = function(url) {
+        try {
+          const resolved = new URL(url, currentTarget).href;
+          window.location.href = endpoint + encodeURIComponent(resolved);
+        } catch(e) {
+          origAssign.call(window.location, url);
+        }
+      };
+    }
+    const origReplace = window.location.replace;
+    if (origReplace) {
+      window.location.replace = function(url) {
+        try {
+          const resolved = new URL(url, currentTarget).href;
+          window.location.href = endpoint + encodeURIComponent(resolved);
+        } catch(e) {
+          origReplace.call(window.location, url);
+        }
+      };
+    }
+  } catch(e) {}
 
   const origPushState = history.pushState;
   history.pushState = function(state, unused, url) {
@@ -1860,4 +1989,5 @@ export {
   resolveProxiedUrl,
   rewriteCss,
   rewriteSrcset,
+  extractTargetFromPath,
 };

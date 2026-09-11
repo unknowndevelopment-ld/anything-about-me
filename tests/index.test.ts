@@ -1,19 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { accessDeniedResponse, isBlockedHostname, serializeCookie, validateTarget } from "../src/index";
+import worker, {
+  accessDeniedResponse,
+  isBlockedHostname,
+  resolveProxiedUrl,
+  rewriteCss,
+  rewriteSrcset,
+  serializeCookie,
+  validateTarget,
+} from "../src/index";
 
 describe("proxy target validation", () => {
-  it("requires an explicit allowlist entry", () => {
-    expect(validateTarget("https://api.example.test/data", "")).toBeNull();
+  it("allows all public websites by default or when wildcard is set", () => {
+    expect(validateTarget("https://api.example.test/data", "")).toBe("https://api.example.test/data");
+    expect(validateTarget("https://api.example.test/data", "*")).toBe("https://api.example.test/data");
+    expect(validateTarget("https://api.example.test/data", "all")).toBe("https://api.example.test/data");
+    expect(validateTarget("example.com", "*")).toBe("https://example.com/");
+  });
+
+  it("supports explicit allowlist restrictions when specified", () => {
     expect(validateTarget("https://api.example.test/data", "https://api.example.test")).toBe(
       "https://api.example.test/data",
     );
+    expect(validateTarget("https://other.example.test/data", "https://api.example.test")).toBeNull();
   });
 
   it("rejects unsafe protocols, credentials, and private hosts", () => {
-    expect(validateTarget("file:///etc/passwd", "file:///")).toBeNull();
-    expect(validateTarget("https://user:pass@api.example.test", "https://api.example.test")).toBeNull();
-    expect(validateTarget("http://127.0.0.1/admin", "http://127.0.0.1")).toBeNull();
+    expect(validateTarget("file:///etc/passwd", "*")).toBeNull();
+    expect(validateTarget("https://user:pass@api.example.test", "*")).toBeNull();
+    expect(validateTarget("http://127.0.0.1/admin", "*")).toBeNull();
+    expect(validateTarget("http://localhost:8080", "*")).toBeNull();
+    expect(validateTarget("http://192.168.1.1", "*")).toBeNull();
+    expect(validateTarget("http://10.0.0.1", "*")).toBeNull();
     expect(isBlockedHostname("169.254.169.254")).toBe(true);
+    expect(isBlockedHostname("metadata.google.internal")).toBe(true);
+    expect(isBlockedHostname("::1")).toBe(true);
   });
 
   it("returns a plain denial for invalid credentials", async () => {
@@ -30,5 +50,70 @@ describe("proxy target validation", () => {
     expect(serializeCookie("session", "value", 60, true, new Request("https://proxy.example/"))).toContain(
       "; Secure",
     );
+  });
+});
+
+describe("proxy URL and asset rewriting", () => {
+  it("resolves relative and absolute URLs through proxy endpoint", () => {
+    expect(resolveProxiedUrl("/about", "https://example.com/sub/page")).toBe(
+      "/proxy?url=https%3A%2F%2Fexample.com%2Fabout",
+    );
+    expect(resolveProxiedUrl("details.html", "https://example.com/sub/page")).toBe(
+      "/proxy?url=https%3A%2F%2Fexample.com%2Fsub%2Fdetails.html",
+    );
+    expect(resolveProxiedUrl("https://other.com/image.png", "https://example.com")).toBe(
+      "/proxy?url=https%3A%2F%2Fother.com%2Fimage.png",
+    );
+    expect(resolveProxiedUrl("#section", "https://example.com")).toBe("#section");
+    expect(resolveProxiedUrl("javascript:void(0)", "https://example.com")).toBe("javascript:void(0)");
+  });
+
+  it("rewrites srcset attributes correctly", () => {
+    const srcset = "small.jpg 300w, large.jpg 800w";
+    const rewritten = rewriteSrcset(srcset, "https://example.com/");
+    expect(rewritten).toContain("/proxy?url=https%3A%2F%2Fexample.com%2Fsmall.jpg 300w");
+    expect(rewritten).toContain("/proxy?url=https%3A%2F%2Fexample.com%2Flarge.jpg 800w");
+  });
+
+  it("rewrites CSS url() and @import statements", () => {
+    const css = 'body { background: url("bg.jpg"); } @import "theme.css";';
+    const rewritten = rewriteCss(css, "https://example.com/style/");
+    expect(rewritten).toContain('url("/proxy?url=https%3A%2F%2Fexample.com%2Fstyle%2Fbg.jpg")');
+    expect(rewritten).toContain('@import "/proxy?url=https%3A%2F%2Fexample.com%2Fstyle%2Ftheme.css"');
+  });
+});
+
+describe("worker fetch handling and diagnostics", () => {
+  const env = {
+    PROXY_USERNAME: "admin",
+    PROXY_PASSWORD: "secretpassword123",
+    SESSION_SECRET: "test-super-secret-key-32-bytes-long!",
+    UPSTREAM_ALLOWLIST: "*",
+  };
+
+  it("responds to /.well-known/config", async () => {
+    const res = await worker.fetch(new Request("http://localhost/.well-known/config"), env);
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { status: string; message: string };
+    expect(json.status).toBe("environment_check");
+    expect(json.message).toBe("All required variables are set");
+  });
+
+  it("serves login page for unauthenticated GET /", async () => {
+    const res = await worker.fetch(new Request("http://localhost/"), env);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Sign in to Browser Proxy");
+    expect(html).toContain('name="csrf"');
+  });
+
+  it("rejects unauthenticated non-html proxy requests with 401", async () => {
+    const res = await worker.fetch(
+      new Request("http://localhost/proxy?url=https://example.com", {
+        headers: { Accept: "application/json" },
+      }),
+      env,
+    );
+    expect(res.status).toBe(401);
   });
 });

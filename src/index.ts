@@ -5,8 +5,9 @@ interface Env {
   UPSTREAM_ALLOWLIST?: string;
 }
 
-const SESSION_COOKIE = "proxy_session";
-const CSRF_COOKIE = "proxy_csrf";
+const SESSION_COOKIE = "session_token";
+const CSRF_COOKIE = "csrf_token";
+const TARGET_COOKIE = "active_target";
 const SESSION_TTL_SECONDS = 24 * 60 * 60;
 const CSRF_TTL_SECONDS = 10 * 60;
 const encoder = new TextEncoder();
@@ -73,24 +74,26 @@ export default {
       return handleLogout(request);
     }
 
-    if (url.pathname === "/proxy") {
-      return handleProxy(request, env);
-    }
-
     if (url.pathname === "/" && request.method === "GET") {
       return homeResponse(request);
     }
 
-    return new Response("Not Found", { status: 404 });
+    // Direct proxy endpoints
+    if (url.pathname === "/service" || url.pathname === "/proxy") {
+      return handleProxy(request, env);
+    }
+
+    // Dynamic Asset & Fallback Routing:
+    // When a page inside the browser loads relative assets (e.g. /load.php, /app.js, /api/...)
+    // resolve against Referer or active target cookie
+    return handleFallbackAsset(request, env);
   },
 };
 
 async function handleLogin(request: Request, env: Env): Promise<Response> {
-  // Check if environment variables are set
   if (!env.PROXY_USERNAME || !env.PROXY_PASSWORD || !env.SESSION_SECRET) {
     return new Response(
-      "ERROR: Worker is not configured. Missing PROXY_USERNAME, PROXY_PASSWORD, or SESSION_SECRET secrets. " +
-        "Run: npx wrangler secret put PROXY_USERNAME && npx wrangler secret put PROXY_PASSWORD && npx wrangler secret put SESSION_SECRET",
+      "ERROR: Server configuration missing. Ensure PROXY_USERNAME, PROXY_PASSWORD, and SESSION_SECRET are set.",
       { status: 503, headers: { "Content-Type": "text/plain" } },
     );
   }
@@ -157,16 +160,54 @@ async function handleLogout(request: Request): Promise<Response> {
   });
 }
 
+async function handleFallbackAsset(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+
+  // 1. Check if ?url= is passed in query
+  if (url.searchParams.has("url")) {
+    return handleProxy(request, env);
+  }
+
+  // 2. Check Referer header
+  const referer = request.headers.get("Referer");
+  if (referer) {
+    try {
+      const refUrl = new URL(referer);
+      const refTarget = refUrl.searchParams.get("url");
+      if (refTarget) {
+        const resolved = new URL(url.pathname + url.search, refTarget).toString();
+        return fetchUpstream(request, resolved, env);
+      }
+    } catch {}
+  }
+
+  // 3. Check active target cookie
+  const cookies = parseCookies(request);
+  const activeTarget = cookies.get(TARGET_COOKIE);
+  if (activeTarget) {
+    try {
+      const resolved = new URL(url.pathname + url.search, activeTarget).toString();
+      return fetchUpstream(request, resolved, env);
+    } catch {}
+  }
+
+  return new Response("Not Found", { status: 404 });
+}
+
 async function handleProxy(request: Request, env: Env): Promise<Response> {
   const target = new URL(request.url).searchParams.get("url");
   if (!target) {
-    return new Response("A proxy target URL is required (?url=...).", {
+    return new Response("Target URL is required (?url=...).", {
       status: 400,
       headers: { "Content-Type": "text/plain" },
     });
   }
 
-  const validatedTarget = validateTarget(target, env.UPSTREAM_ALLOWLIST);
+  return fetchUpstream(request, target, env);
+}
+
+async function fetchUpstream(request: Request, rawTarget: string, env: Env): Promise<Response> {
+  const validatedTarget = validateTarget(rawTarget, env.UPSTREAM_ALLOWLIST);
   if (!validatedTarget) {
     return accessDeniedResponse();
   }
@@ -178,7 +219,6 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
     const forwardHeaders = new Headers();
     for (const [key, value] of request.headers.entries()) {
       const lowerKey = key.toLowerCase();
-      // Skip Cloudflare, host-specific, and hop-by-hop headers
       if (
         lowerKey.startsWith("cf-") ||
         lowerKey.startsWith("x-forwarded-") ||
@@ -199,14 +239,23 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
     forwardHeaders.set("Host", targetParsed.host);
     forwardHeaders.set("Origin", targetParsed.origin);
     forwardHeaders.set("Referer", validatedTarget);
+
     if (!forwardHeaders.has("User-Agent")) {
       forwardHeaders.set(
         "User-Agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
       );
     }
+    if (!forwardHeaders.has("Accept")) {
+      forwardHeaders.set(
+        "Accept",
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      );
+    }
+    if (!forwardHeaders.has("Accept-Language")) {
+      forwardHeaders.set("Accept-Language", "en-US,en;q=0.9");
+    }
 
-    // Forward request body for methods that support it
     const hasBody = !["GET", "HEAD"].includes(request.method.toUpperCase()) && request.body !== null;
 
     const upstreamResponse = await fetch(validatedTarget, {
@@ -218,20 +267,32 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
 
     const headers = new Headers(upstreamResponse.headers);
 
-    // Remove security headers that prevent framing and script execution
-    headers.delete("X-Frame-Options");
-    headers.delete("Content-Security-Policy");
-    headers.delete("Content-Security-Policy-Report-Only");
-    headers.delete("Cross-Origin-Opener-Policy");
-    headers.delete("Cross-Origin-Embedder-Policy");
-    headers.delete("Cross-Origin-Resource-Policy");
-    headers.delete("Strict-Transport-Security");
+    // CRITICAL: Strip compression headers because Cloudflare automatically decompresses the stream
+    headers.delete("content-encoding");
+    headers.delete("content-length");
+    headers.delete("transfer-encoding");
 
-    // Add CORS headers so AJAX / subresources work seamlessly
+    // Remove security headers that prevent framing and script execution
+    headers.delete("x-frame-options");
+    headers.delete("content-security-policy");
+    headers.delete("content-security-policy-report-only");
+    headers.delete("cross-origin-opener-policy");
+    headers.delete("cross-origin-embedder-policy");
+    headers.delete("cross-origin-resource-policy");
+    headers.delete("strict-transport-security");
+    headers.delete("permissions-policy");
+
+    // Add open CORS headers
     headers.set("Access-Control-Allow-Origin", "*");
     headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD");
     headers.set("Access-Control-Allow-Headers", "*");
     headers.set("X-Content-Type-Options", "nosniff");
+
+    // Set cookie tracking the active upstream origin
+    headers.append(
+      "Set-Cookie",
+      serializeCookie(TARGET_COOKIE, targetParsed.origin, SESSION_TTL_SECONDS, false, request),
+    );
 
     // Handle HTTP Redirects (301, 302, 303, 307, 308)
     const location = upstreamResponse.headers.get("Location");
@@ -240,7 +301,7 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
         const redirectedTarget = new URL(location, validatedTarget).toString();
         const safeRedirect = validateTarget(redirectedTarget, env.UPSTREAM_ALLOWLIST);
         if (safeRedirect) {
-          headers.set("Location", `/proxy?url=${encodeURIComponent(safeRedirect)}`);
+          headers.set("Location", `/service?url=${encodeURIComponent(safeRedirect)}`);
         }
       } catch {
         // Leave location header as-is if unresolvable
@@ -251,7 +312,6 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
 
     // Rewrite HTML responses
     if (contentType.includes("text/html")) {
-      headers.delete("Content-Length");
       const baseResponse = new Response(upstreamResponse.body, {
         status: upstreamResponse.status,
         statusText: upstreamResponse.statusText,
@@ -262,7 +322,6 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
 
     // Rewrite CSS responses
     if (contentType.includes("text/css")) {
-      headers.delete("Content-Length");
       const cssText = await upstreamResponse.text();
       const rewrittenCss = rewriteCss(cssText, validatedTarget);
       return new Response(rewrittenCss, {
@@ -278,8 +337,8 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
       headers,
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    return new Response(`The upstream could not be reached: ${message}`, {
+    const message = err instanceof Error ? err.message : "Error connecting";
+    return new Response(`Unable to reach target: ${message}`, {
       status: 502,
       headers: { "Content-Type": "text/plain" },
     });
@@ -295,13 +354,14 @@ function resolveProxiedUrl(relativeOrAbsolute: string, baseUrl: string): string 
     trimmed.startsWith("tel:") ||
     trimmed.startsWith("data:") ||
     trimmed.startsWith("#") ||
+    trimmed.startsWith("/service?url=") ||
     trimmed.startsWith("/proxy?url=")
   ) {
     return relativeOrAbsolute;
   }
   try {
     const resolved = new URL(trimmed, baseUrl).toString();
-    return `/proxy?url=${encodeURIComponent(resolved)}`;
+    return `/service?url=${encodeURIComponent(resolved)}`;
   } catch {
     return relativeOrAbsolute;
   }
@@ -323,14 +383,20 @@ function rewriteSrcset(srcset: string, baseUrl: string): string {
 function rewriteCss(cssText: string, baseUrl: string): string {
   return cssText
     .replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (match, quote, url) => {
-      if (!url || url.startsWith("data:") || url.startsWith("#") || url.startsWith("/proxy?url=")) {
+      if (
+        !url ||
+        url.startsWith("data:") ||
+        url.startsWith("#") ||
+        url.startsWith("/service?url=") ||
+        url.startsWith("/proxy?url=")
+      ) {
         return match;
       }
       const proxied = resolveProxiedUrl(url, baseUrl);
       return `url("${proxied}")`;
     })
     .replace(/@import\s+(['"])(.*?)\1/gi, (match, quote, url) => {
-      if (!url || url.startsWith("data:") || url.startsWith("/proxy?url=")) {
+      if (!url || url.startsWith("data:") || url.startsWith("/service?url=") || url.startsWith("/proxy?url=")) {
         return match;
       }
       const proxied = resolveProxiedUrl(url, baseUrl);
@@ -339,31 +405,42 @@ function rewriteCss(cssText: string, baseUrl: string): string {
 }
 
 function rewriteHtml(response: Response, targetUrl: string): Response {
-  const clientHookScript = `<script id="__proxy_client_hook__">
+  const targetParsed = new URL(targetUrl);
+  const baseTag = `<base href="${targetUrl}">`;
+
+  const clientHookScript = `<script id="__client_nav_hook__">
 (function() {
   const currentTarget = ${JSON.stringify(targetUrl)};
-  const proxyEndpoint = '/proxy?url=';
+  const currentOrigin = ${JSON.stringify(targetParsed.origin)};
+  const endpoint = '/service?url=';
 
-  function toProxied(rawUrl) {
+  // Disable ServiceWorker registration cleanly to prevent worker scope conflicts
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register = function() {
+      return Promise.reject(new Error('ServiceWorker not supported in container'));
+    };
+  }
+
+  function toRouted(rawUrl) {
     if (!rawUrl) return rawUrl;
     const str = String(rawUrl).trim();
-    if (str.startsWith('javascript:') || str.startsWith('mailto:') || str.startsWith('tel:') || str.startsWith('data:') || str.startsWith('#') || str.startsWith('/proxy?url=')) {
+    if (str.startsWith('javascript:') || str.startsWith('mailto:') || str.startsWith('tel:') || str.startsWith('data:') || str.startsWith('#') || str.startsWith('/service?url=') || str.startsWith('/proxy?url=')) {
       return str;
     }
     try {
       const resolved = new URL(str, currentTarget).href;
-      return proxyEndpoint + encodeURIComponent(resolved);
+      return endpoint + encodeURIComponent(resolved);
     } catch (e) {
       return str;
     }
   }
 
-  function notifyParent() {
+  function notifyParent(urlOverride) {
     try {
       if (window.parent && window.parent !== window) {
         window.parent.postMessage({
-          type: 'proxy_navigated',
-          url: currentTarget,
+          type: 'client_navigated',
+          url: urlOverride || currentTarget,
           title: document.title || currentTarget
         }, '*');
       }
@@ -387,12 +464,12 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
       const resolved = new URL(href, currentTarget).href;
       const targetAttr = el.getAttribute('target');
       if (targetAttr === '_blank' && window.parent && window.parent !== window) {
-        window.parent.postMessage({ type: 'proxy_open_tab', url: resolved }, '*');
+        window.parent.postMessage({ type: 'client_open_tab', url: resolved }, '*');
       } else {
-        window.location.href = proxyEndpoint + encodeURIComponent(resolved);
+        window.location.href = endpoint + encodeURIComponent(resolved);
       }
     } catch(err) {
-      window.location.href = proxyEndpoint + encodeURIComponent(el.href);
+      window.location.href = el.href;
     }
   }, true);
 
@@ -402,7 +479,7 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     if (!form || form.tagName !== 'FORM') return;
     try {
       const action = form.getAttribute('action') || '';
-      form.action = proxyEndpoint + encodeURIComponent(new URL(action, currentTarget).href);
+      form.action = endpoint + encodeURIComponent(new URL(action, currentTarget).href);
     } catch(err) {}
   }, true);
 
@@ -413,45 +490,73 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     try {
       const resolved = new URL(url, currentTarget).href;
       if (window.parent && window.parent !== window) {
-        window.parent.postMessage({ type: 'proxy_open_tab', url: resolved }, '*');
+        window.parent.postMessage({ type: 'client_open_tab', url: resolved }, '*');
         return null;
       }
-      return origOpen.call(window, proxyEndpoint + encodeURIComponent(resolved), target, features);
+      return origOpen.call(window, endpoint + encodeURIComponent(resolved), target, features);
     } catch(e) {
       return origOpen.apply(window, arguments);
     }
   };
 
+  // Intercept SPA navigation (pushState / replaceState)
+  const origPushState = history.pushState;
+  history.pushState = function(state, unused, url) {
+    if (url) {
+      try {
+        const resolved = new URL(url, currentTarget).href;
+        notifyParent(resolved);
+      } catch(e) {}
+    }
+    return origPushState.apply(this, arguments);
+  };
+
+  const origReplaceState = history.replaceState;
+  history.replaceState = function(state, unused, url) {
+    if (url) {
+      try {
+        const resolved = new URL(url, currentTarget).href;
+        notifyParent(resolved);
+      } catch(e) {}
+    }
+    return origReplaceState.apply(this, arguments);
+  };
+
   // Intercept fetch
   const origFetch = window.fetch;
   window.fetch = function(input, init) {
-    if (typeof input === 'string') {
-      input = toProxied(input);
-    } else if (input instanceof Request) {
-      input = new Request(toProxied(input.url), input);
-    }
+    try {
+      if (typeof input === 'string') {
+        input = toRouted(input);
+      } else if (input && typeof input === 'object' && 'url' in input) {
+        input = toRouted(input.url);
+      }
+    } catch(e) {}
     return origFetch.call(this, input, init);
   };
 
   // Intercept XMLHttpRequest
   const origXhrOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-    return origXhrOpen.call(this, method, toProxied(url), ...rest);
+    try {
+      url = toRouted(url);
+    } catch(e) {}
+    return origXhrOpen.call(this, method, url, ...rest);
   };
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', notifyParent);
+    document.addEventListener('DOMContentLoaded', function() { notifyParent(); });
   } else {
     notifyParent();
   }
-  window.addEventListener('load', notifyParent);
+  window.addEventListener('load', function() { notifyParent(); });
 })();
 </script>`;
 
   const rewriter = new HTMLRewriter()
     .on("head", {
       element(element) {
-        element.prepend(clientHookScript, { html: true });
+        element.prepend(baseTag + clientHookScript, { html: true });
       },
     })
     .on("a", {
@@ -574,7 +679,6 @@ function validateTarget(rawTarget: string, allowlist?: string): string | null {
   }
 
   let targetStr = rawTarget.trim();
-  // If no scheme present (e.g. example.com or google.com/search), prepend https://
   if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/i.test(targetStr)) {
     targetStr = `https://${targetStr}`;
   }
@@ -595,7 +699,6 @@ function validateTarget(rawTarget: string, allowlist?: string): string | null {
     return null;
   }
 
-  // If allowlist is empty, "*", "all", "https://" or not specified, allow all public websites
   const trimmedAllowlist = (allowlist ?? "").trim();
   if (
     !trimmedAllowlist ||
@@ -630,7 +733,6 @@ function validateTarget(rawTarget: string, allowlist?: string): string | null {
 function isBlockedHostname(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
 
-  // Check reserved hostnames
   if (
     host === "localhost" ||
     host.endsWith(".localhost") ||
@@ -641,12 +743,10 @@ function isBlockedHostname(hostname: string): boolean {
     return true;
   }
 
-  // Check IPv6 loopback and link-local
   if (host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:")) {
     return true;
   }
 
-  // Try to parse as IPv4
   const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (ipv4Match) {
     const octets = [
@@ -656,12 +756,10 @@ function isBlockedHostname(hostname: string): boolean {
       parseInt(ipv4Match[4], 10),
     ];
 
-    // Validate octet range
     if (octets.some((octet) => octet > 255)) {
       return true;
     }
 
-    // Check reserved IPv4 ranges
     return (
       octets[0] === 0 ||
       octets[0] === 10 ||
@@ -762,7 +860,7 @@ function homeResponse(request: Request): Response {
 }
 
 function accessDeniedResponse(): Response {
-  return new Response("403 Access Denied", {
+  return new Response("403 Forbidden", {
     status: 403,
     headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
   });
@@ -771,29 +869,29 @@ function accessDeniedResponse(): Response {
 function loginPage(csrf: string, env: Env): string {
   const envStatus =
     !env.PROXY_USERNAME || !env.PROXY_PASSWORD || !env.SESSION_SECRET
-      ? `<div style="background:#fee2e2;border:1px solid #fca5a5;color:#991b1b;padding:12px;margin-bottom:16px;border-radius:6px;font-size:14px;"><strong>⚠️ Setup Required:</strong> Missing environment secrets. Set them with:<br><code>npx wrangler secret put PROXY_USERNAME</code><br><code>npx wrangler secret put PROXY_PASSWORD</code><br><code>npx wrangler secret put SESSION_SECRET</code></div>`
+      ? `<div style="background:#1f1212;border:1px solid #3d1c1c;color:#f87171;padding:12px;margin-bottom:20px;border-radius:6px;font-size:13px;text-align:left;">Setup required: secrets not configured.</div>`
       : "";
 
   return page(
-    "Sign in - Browser Proxy",
-    `${envStatus}<div class="login-modal" role="dialog" aria-modal="true" aria-labelledby="login-title">
-    <div class="brand-icon">🌐</div>
-    <h2 id="login-title">Sign in to Browser Proxy</h2>
-    <p>Access the full unrestricted web proxy. Your secure session remains active for 24 hours.</p>
-    <form method="post" action="/login">
-      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-      <label>Username <input name="username" autocomplete="username" placeholder="Username" required autofocus></label>
-      <label>Password <input type="password" name="password" autocomplete="current-password" placeholder="Password" required></label>
-      <button type="submit" class="btn-primary">Sign in</button>
-    </form>
+    "",
+    `<div class="login-wrapper">
+    <div class="login-modal">
+      ${envStatus}
+      <form method="post" action="/login">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+        <input name="username" autocomplete="username" placeholder="Username" required autofocus spellcheck="false">
+        <input type="password" name="password" autocomplete="current-password" placeholder="Password" required>
+        <button type="submit" class="btn-primary">Sign in</button>
+      </form>
+    </div>
   </div>`,
   );
 }
 
 function homePage(csrf: string): string {
   return page(
-    "Browser Proxy",
-    `<div class="browser">
+    "",
+    `<div class="app-container">
     <div class="tabs-bar">
       <div class="tabs" id="tab-list" role="tablist"></div>
       <button id="new-tab-btn" class="new-tab-btn" type="button" title="New Tab" aria-label="New Tab">+</button>
@@ -801,22 +899,21 @@ function homePage(csrf: string): string {
     <div class="toolbar">
       <div class="nav-buttons">
         <button class="icon-button" id="back" type="button" title="Back" aria-label="Back">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
         </button>
         <button class="icon-button" id="forward" type="button" title="Forward" aria-label="Forward">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
         </button>
         <button class="icon-button" id="refresh" type="button" title="Reload" aria-label="Reload">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
         </button>
         <button class="icon-button" id="home" type="button" title="Home" aria-label="Home">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
         </button>
       </div>
       <form id="address-form" class="address-form">
         <div class="address-input-wrapper">
-          <span class="url-lock">🔒</span>
-          <input id="address" type="text" placeholder="Search with DuckDuckGo or enter URL (e.g. wikipedia.org)" autocomplete="off" spellcheck="false" required>
+          <input id="address" type="text" placeholder="Search or enter URL..." autocomplete="off" spellcheck="false" required>
           <div id="loader" class="loader hidden"></div>
         </div>
         <button type="submit" class="btn-go">Go</button>
@@ -828,16 +925,8 @@ function homePage(csrf: string): string {
         </form>
       </div>
     </div>
-    <div class="quick-bookmarks">
-      <span class="quick-title">Suggestions:</span>
-      <button type="button" class="quick-link" data-url="https://en.wikipedia.org">Wikipedia</button>
-      <button type="button" class="quick-link" data-url="https://duckduckgo.com/html/">DuckDuckGo</button>
-      <button type="button" class="quick-link" data-url="https://news.ycombinator.com">Hacker News</button>
-      <button type="button" class="quick-link" data-url="https://github.com">GitHub</button>
-      <button type="button" class="quick-link" data-url="https://example.com">Example.com</button>
-    </div>
     <div class="viewport-container">
-      <iframe id="viewport" title="Proxy viewport" sandbox="allow-forms allow-scripts allow-same-origin allow-popups allow-modals allow-presentation allow-downloads allow-pointer-lock" referrerpolicy="no-referrer"></iframe>
+      <iframe id="viewport" title="Viewport" allow="fullscreen; clipboard-read; clipboard-write; microphone; camera; midi; encrypted-media; autodiscovery" referrerpolicy="no-referrer"></iframe>
     </div>
   </div>
   <script>
@@ -859,11 +948,9 @@ function homePage(csrf: string): string {
       const trimmed = input.trim();
       if (!trimmed) return 'https://duckduckgo.com/html/';
       if (/^https?:\\/\\//i.test(trimmed)) return trimmed;
-      // Check if it looks like a domain name (contains a dot and no spaces)
       if (!/\\s/.test(trimmed) && trimmed.includes('.')) {
         return 'https://' + trimmed;
       }
-      // Otherwise treat as search query
       return 'https://duckduckgo.com/html/?q=' + encodeURIComponent(trimmed);
     }
 
@@ -905,7 +992,7 @@ function homePage(csrf: string): string {
       
       if (tab.url) {
         showLoader();
-        viewport.src = '/proxy?url=' + encodeURIComponent(tab.url);
+        viewport.src = '/service?url=' + encodeURIComponent(tab.url);
       } else {
         hideLoader();
         viewport.src = 'about:blank';
@@ -962,7 +1049,7 @@ function homePage(csrf: string): string {
 
       address.value = url;
       showLoader();
-      viewport.src = '/proxy?url=' + encodeURIComponent(url);
+      viewport.src = '/service?url=' + encodeURIComponent(url);
       renderTabs();
       updateButtons();
     }
@@ -998,7 +1085,7 @@ function homePage(csrf: string): string {
       tab.title = extractHost(tab.url);
       address.value = tab.url;
       showLoader();
-      viewport.src = '/proxy?url=' + encodeURIComponent(tab.url);
+      viewport.src = '/service?url=' + encodeURIComponent(tab.url);
       renderTabs();
       updateButtons();
     });
@@ -1011,7 +1098,7 @@ function homePage(csrf: string): string {
       tab.title = extractHost(tab.url);
       address.value = tab.url;
       showLoader();
-      viewport.src = '/proxy?url=' + encodeURIComponent(tab.url);
+      viewport.src = '/service?url=' + encodeURIComponent(tab.url);
       renderTabs();
       updateButtons();
     });
@@ -1020,7 +1107,7 @@ function homePage(csrf: string): string {
       const tab = tabs[activeIndex];
       if (tab && tab.url) {
         showLoader();
-        viewport.src = '/proxy?url=' + encodeURIComponent(tab.url);
+        viewport.src = '/service?url=' + encodeURIComponent(tab.url);
       }
     });
 
@@ -1030,17 +1117,9 @@ function homePage(csrf: string): string {
 
     newTabBtn.addEventListener('click', () => addTab());
 
-    document.querySelectorAll('.quick-link').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const u = btn.getAttribute('data-url');
-        if (u) navigate(u, false);
-      });
-    });
-
-    // Listen to messages sent from the proxied page inside iframe
     window.addEventListener('message', (event) => {
       if (!event.data) return;
-      if (event.data.type === 'proxy_navigated') {
+      if (event.data.type === 'client_navigated') {
         const tab = tabs[activeIndex];
         if (tab && event.data.url) {
           tab.url = event.data.url;
@@ -1057,12 +1136,11 @@ function homePage(csrf: string): string {
           updateButtons();
           hideLoader();
         }
-      } else if (event.data.type === 'proxy_open_tab' && event.data.url) {
+      } else if (event.data.type === 'client_open_tab' && event.data.url) {
         addTab(event.data.url);
       }
     });
 
-    // Initialize with default search tab
     addTab('https://duckduckgo.com/html/');
   })();
   </script>`,
@@ -1070,55 +1148,96 @@ function homePage(csrf: string): string {
 }
 
 function page(title: string, body: string): string {
+  const pageTitle = title ? escapeHtml(title) : "";
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>${escapeHtml(title)}</title>
+  <title>${pageTitle}</title>
   <style>
     :root {
-      --bg-main: #0f172a;
-      --bg-surface: #1e293b;
-      --bg-input: #334155;
-      --text-main: #f8fafc;
-      --text-muted: #94a3b8;
-      --primary: #3b82f6;
-      --primary-hover: #2563eb;
-      --border: #334155;
-      --tab-active: #1e293b;
-      --tab-inactive: #0f172a;
+      --bg-root: #0a0a0a;
+      --bg-surface: #141414;
+      --bg-card: #171717;
+      --bg-input: #1f1f1f;
+      --border-subtle: #262626;
+      --border-hover: #404040;
+      --text-main: #ededed;
+      --text-muted: #737373;
+      --btn-bg: #222222;
+      --btn-hover: #2e2e2e;
+      --tab-active: #141414;
+      --tab-inactive: #0a0a0a;
     }
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      margin: 0;
-      padding: 0;
-      background: var(--bg-main);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg-root);
       color: var(--text-main);
       height: 100vh;
       overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+    .login-wrapper {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      width: 100vw;
+      background: var(--bg-root);
     }
     .login-modal {
-      background: var(--bg-surface);
-      border-radius: 12px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-      border: 1px solid var(--border);
-      padding: 36px;
-      max-width: 400px;
-      margin: 80px auto;
-      text-align: center;
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.8);
+      padding: 32px 28px;
+      width: 100%;
+      max-width: 320px;
     }
-    .brand-icon { font-size: 40px; margin-bottom: 12px; }
-    .login-modal h2 { margin: 0 0 8px; font-size: 22px; color: #fff; }
-    .login-modal p { font-size: 14px; color: var(--text-muted); margin-bottom: 24px; line-height: 1.5; }
-    .login-modal label { display: block; text-align: left; font-size: 13px; font-weight: 500; margin-bottom: 16px; color: var(--text-muted); }
-    .login-modal input { width: 100%; padding: 10px 14px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; color: #fff; font-size: 15px; margin-top: 6px; }
-    .login-modal input:focus { outline: none; border-color: var(--primary); }
-    .btn-primary { width: 100%; padding: 12px; background: var(--primary); color: #fff; border: none; border-radius: 6px; font-weight: 600; font-size: 15px; cursor: pointer; transition: background 0.2s; margin-top: 8px; }
-    .btn-primary:hover { background: var(--primary-hover); }
+    .login-modal form {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .login-modal input {
+      width: 100%;
+      padding: 12px 14px;
+      background: var(--bg-input);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      color: var(--text-main);
+      font-size: 14px;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .login-modal input:focus {
+      outline: none;
+      border-color: var(--border-hover);
+      background: #242424;
+    }
+    .login-modal input::placeholder {
+      color: var(--text-muted);
+    }
+    .btn-primary {
+      width: 100%;
+      padding: 12px;
+      background: var(--btn-bg);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-main);
+      border-radius: 6px;
+      font-weight: 500;
+      font-size: 14px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+      margin-top: 4px;
+    }
+    .btn-primary:hover {
+      background: var(--btn-hover);
+      border-color: var(--border-hover);
+    }
 
-    .browser {
+    .app-container {
       display: flex;
       flex-direction: column;
       height: 100vh;
@@ -1127,15 +1246,15 @@ function page(title: string, body: string): string {
     .tabs-bar {
       display: flex;
       align-items: center;
-      background: var(--bg-main);
+      background: var(--bg-root);
       padding: 6px 8px 0;
-      gap: 4px;
-      border-bottom: 1px solid var(--border);
+      gap: 3px;
+      border-bottom: 1px solid var(--border-subtle);
       user-select: none;
     }
     .tabs {
       display: flex;
-      gap: 4px;
+      gap: 3px;
       overflow-x: auto;
       flex: 1;
       scrollbar-width: none;
@@ -1145,23 +1264,22 @@ function page(title: string, body: string): string {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 14px;
+      padding: 7px 12px;
       background: var(--tab-inactive);
       color: var(--text-muted);
-      border-radius: 8px 8px 0 0;
-      font-size: 13px;
-      max-width: 200px;
+      border-radius: 6px 6px 0 0;
+      font-size: 12px;
+      max-width: 180px;
       cursor: pointer;
       border: 1px solid transparent;
       border-bottom: none;
       transition: all 0.15s;
     }
-    .tab:hover { background: #1e293b88; color: #fff; }
+    .tab:hover { background: #171717; color: #d4d4d4; }
     .tab.active {
       background: var(--tab-active);
-      color: #fff;
-      font-weight: 500;
-      border-color: var(--border);
+      color: #fafafa;
+      border-color: var(--border-subtle);
     }
     .tab-title {
       white-space: nowrap;
@@ -1174,51 +1292,51 @@ function page(title: string, body: string): string {
       border: none;
       color: var(--text-muted);
       cursor: pointer;
-      font-size: 16px;
+      font-size: 14px;
       line-height: 1;
-      padding: 2px 4px;
-      border-radius: 4px;
+      padding: 1px 3px;
+      border-radius: 3px;
     }
-    .tab-close:hover { background: #475569; color: #fff; }
+    .tab-close:hover { background: #333333; color: #fff; }
     .new-tab-btn {
       background: transparent;
       border: none;
       color: var(--text-muted);
-      font-size: 18px;
+      font-size: 16px;
       cursor: pointer;
-      padding: 4px 10px;
-      border-radius: 6px;
+      padding: 4px 8px;
+      border-radius: 4px;
       margin-bottom: 2px;
     }
-    .new-tab-btn:hover { background: var(--bg-input); color: #fff; }
+    .new-tab-btn:hover { background: #171717; color: #fff; }
 
     .toolbar {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 12px;
+      padding: 6px 10px;
       background: var(--bg-surface);
-      border-bottom: 1px solid var(--border);
+      border-bottom: 1px solid var(--border-subtle);
     }
-    .nav-buttons { display: flex; gap: 4px; align-items: center; }
+    .nav-buttons { display: flex; gap: 2px; align-items: center; }
     .icon-button {
       background: transparent;
       border: none;
       color: var(--text-muted);
       cursor: pointer;
-      padding: 6px 8px;
-      border-radius: 6px;
+      padding: 6px 7px;
+      border-radius: 4px;
       display: flex;
       align-items: center;
       justify-content: center;
     }
-    .icon-button:hover:not(:disabled) { background: var(--bg-input); color: #fff; }
-    .icon-button:disabled { opacity: 0.3; cursor: not-allowed; }
+    .icon-button:hover:not(:disabled) { background: #262626; color: #fff; }
+    .icon-button:disabled { opacity: 0.2; cursor: not-allowed; }
 
     .address-form {
       display: flex;
       flex: 1;
-      gap: 8px;
+      gap: 6px;
       align-items: center;
     }
     .address-input-wrapper {
@@ -1227,88 +1345,63 @@ function page(title: string, body: string): string {
       align-items: center;
       flex: 1;
     }
-    .url-lock {
-      position: absolute;
-      left: 10px;
-      font-size: 12px;
-      opacity: 0.7;
-    }
     #address {
       width: 100%;
-      padding: 8px 36px 8px 32px;
+      padding: 6px 30px 6px 12px;
       background: var(--bg-input);
-      border: 1px solid transparent;
-      border-radius: 20px;
-      color: #fff;
-      font-size: 14px;
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      color: var(--text-main);
+      font-size: 13px;
       font-family: inherit;
     }
     #address:focus {
       outline: none;
-      border-color: var(--primary);
-      background: #1e293b;
+      border-color: var(--border-hover);
+      background: #242424;
+    }
+    #address::placeholder {
+      color: var(--text-muted);
     }
     .btn-go {
-      padding: 6px 16px;
-      background: var(--primary);
-      border: none;
-      border-radius: 20px;
-      color: #fff;
-      font-weight: 500;
-      font-size: 13px;
+      padding: 6px 12px;
+      background: var(--btn-bg);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      color: var(--text-main);
+      font-size: 12px;
       cursor: pointer;
     }
-    .btn-go:hover { background: var(--primary-hover); }
+    .btn-go:hover { background: var(--btn-hover); border-color: var(--border-hover); }
     .signout-btn {
-      padding: 6px 12px;
+      padding: 6px 10px;
       background: transparent;
-      border: 1px solid var(--border);
-      border-radius: 6px;
+      border: 1px solid var(--border-subtle);
+      border-radius: 4px;
       color: var(--text-muted);
       font-size: 12px;
       cursor: pointer;
     }
-    .signout-btn:hover { background: #e11d4822; border-color: #e11d48; color: #f43f5e; }
+    .signout-btn:hover { background: #262626; color: #d4d4d4; }
 
     .loader {
       position: absolute;
-      right: 12px;
-      width: 14px;
-      height: 14px;
-      border: 2px solid #64748b;
-      border-top-color: var(--primary);
+      right: 10px;
+      width: 12px;
+      height: 12px;
+      border: 2px solid #404040;
+      border-top-color: #ededed;
       border-radius: 50%;
       animation: spin 0.8s linear infinite;
     }
     .loader.hidden { display: none; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    .quick-bookmarks {
-      display: flex;
-      gap: 8px;
-      padding: 6px 14px;
-      background: #0f172a88;
-      border-bottom: 1px solid var(--border);
-      align-items: center;
-      font-size: 12px;
-    }
-    .quick-title { color: var(--text-muted); }
-    .quick-link {
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      color: #93c5fd;
-      border-radius: 4px;
-      padding: 2px 8px;
-      cursor: pointer;
-      font-size: 12px;
-    }
-    .quick-link:hover { background: #3b82f622; border-color: var(--primary); color: #fff; }
-
     .viewport-container {
       flex: 1;
       width: 100%;
       position: relative;
-      background: #fff;
+      background: #000;
     }
     #viewport {
       width: 100%;
@@ -1357,7 +1450,7 @@ function serializeCookie(
   request: Request,
 ): string {
   const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
-  return `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}${secure}; SameSite=Strict${httpOnly ? "; HttpOnly" : ""}`;
+  return `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}${secure}; SameSite=Lax${httpOnly ? "; HttpOnly" : ""}`;
 }
 
 function constantTimeEqual(left: string, right: string): boolean {

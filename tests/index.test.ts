@@ -9,7 +9,7 @@ import worker, {
   validateTarget,
 } from "../src/index";
 
-describe("proxy target validation", () => {
+describe("target validation", () => {
   it("allows all public websites by default or when wildcard is set", () => {
     expect(validateTarget("https://api.example.test/data", "")).toBe("https://api.example.test/data");
     expect(validateTarget("https://api.example.test/data", "*")).toBe("https://api.example.test/data");
@@ -40,29 +40,29 @@ describe("proxy target validation", () => {
     const denied = accessDeniedResponse();
     expect(denied.status).toBe(403);
     expect(denied.headers.get("Content-Type")).toContain("text/plain");
-    expect(await denied.text()).toBe("403 Access Denied");
+    expect(await denied.text()).toBe("403 Forbidden");
   });
 
-  it("only marks cookies Secure when the Worker request is HTTPS", () => {
+  it("only marks cookies Secure when the request is HTTPS", () => {
     expect(serializeCookie("session", "value", 60, true, new Request("http://localhost/"))).not.toContain(
       "; Secure",
     );
-    expect(serializeCookie("session", "value", 60, true, new Request("https://proxy.example/"))).toContain(
+    expect(serializeCookie("session", "value", 60, true, new Request("https://portal.example/"))).toContain(
       "; Secure",
     );
   });
 });
 
-describe("proxy URL and asset rewriting", () => {
-  it("resolves relative and absolute URLs through proxy endpoint", () => {
+describe("URL and asset rewriting", () => {
+  it("resolves relative and absolute URLs through service endpoint", () => {
     expect(resolveProxiedUrl("/about", "https://example.com/sub/page")).toBe(
-      "/proxy?url=https%3A%2F%2Fexample.com%2Fabout",
+      "/service?url=https%3A%2F%2Fexample.com%2Fabout",
     );
     expect(resolveProxiedUrl("details.html", "https://example.com/sub/page")).toBe(
-      "/proxy?url=https%3A%2F%2Fexample.com%2Fsub%2Fdetails.html",
+      "/service?url=https%3A%2F%2Fexample.com%2Fsub%2Fdetails.html",
     );
     expect(resolveProxiedUrl("https://other.com/image.png", "https://example.com")).toBe(
-      "/proxy?url=https%3A%2F%2Fother.com%2Fimage.png",
+      "/service?url=https%3A%2F%2Fother.com%2Fimage.png",
     );
     expect(resolveProxiedUrl("#section", "https://example.com")).toBe("#section");
     expect(resolveProxiedUrl("javascript:void(0)", "https://example.com")).toBe("javascript:void(0)");
@@ -71,19 +71,19 @@ describe("proxy URL and asset rewriting", () => {
   it("rewrites srcset attributes correctly", () => {
     const srcset = "small.jpg 300w, large.jpg 800w";
     const rewritten = rewriteSrcset(srcset, "https://example.com/");
-    expect(rewritten).toContain("/proxy?url=https%3A%2F%2Fexample.com%2Fsmall.jpg 300w");
-    expect(rewritten).toContain("/proxy?url=https%3A%2F%2Fexample.com%2Flarge.jpg 800w");
+    expect(rewritten).toContain("/service?url=https%3A%2F%2Fexample.com%2Fsmall.jpg 300w");
+    expect(rewritten).toContain("/service?url=https%3A%2F%2Fexample.com%2Flarge.jpg 800w");
   });
 
   it("rewrites CSS url() and @import statements", () => {
     const css = 'body { background: url("bg.jpg"); } @import "theme.css";';
     const rewritten = rewriteCss(css, "https://example.com/style/");
-    expect(rewritten).toContain('url("/proxy?url=https%3A%2F%2Fexample.com%2Fstyle%2Fbg.jpg")');
-    expect(rewritten).toContain('@import "/proxy?url=https%3A%2F%2Fexample.com%2Fstyle%2Ftheme.css"');
+    expect(rewritten).toContain('url("/service?url=https%3A%2F%2Fexample.com%2Fstyle%2Fbg.jpg")');
+    expect(rewritten).toContain('@import "/service?url=https%3A%2F%2Fexample.com%2Fstyle%2Ftheme.css"');
   });
 });
 
-describe("worker fetch handling and diagnostics", () => {
+describe("fetch handling and diagnostics", () => {
   const env = {
     PROXY_USERNAME: "admin",
     PROXY_PASSWORD: "secretpassword123",
@@ -99,17 +99,20 @@ describe("worker fetch handling and diagnostics", () => {
     expect(json.message).toBe("All required variables are set");
   });
 
-  it("serves login page for unauthenticated GET /", async () => {
+  it("serves minimalist anonymous login page for unauthenticated GET /", async () => {
     const res = await worker.fetch(new Request("http://localhost/"), env);
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("Sign in to Browser Proxy");
+    expect(html).not.toContain("proxy");
+    expect(html).not.toContain("Proxy");
+    expect(html).toContain('placeholder="Username"');
+    expect(html).toContain('placeholder="Password"');
     expect(html).toContain('name="csrf"');
   });
 
-  it("rejects unauthenticated non-html proxy requests with 401", async () => {
+  it("rejects unauthenticated non-html requests with 401", async () => {
     const res = await worker.fetch(
-      new Request("http://localhost/proxy?url=https://example.com", {
+      new Request("http://localhost/service?url=https://example.com", {
         headers: { Accept: "application/json" },
       }),
       env,
@@ -117,3 +120,4 @@ describe("worker fetch handling and diagnostics", () => {
     expect(res.status).toBe(401);
   });
 });
+

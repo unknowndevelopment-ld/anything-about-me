@@ -12,17 +12,13 @@ const SESSION_TTL_SECONDS = 24 * 60 * 60;
 const CSRF_TTL_SECONDS = 10 * 60;
 const encoder = new TextEncoder();
 
-// Cache for parsed allowlists to avoid re-parsing on every request
 const allowlistCache = new Map<string, URL[]>();
-
-// Cache for HMAC keys to avoid re-importing on every signature operation
 const keyCache = new Map<string, CryptoKey>();
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // Diagnostic endpoint to check environment setup
     if (url.pathname === "/.well-known/config" && request.method === "GET") {
       const hasUsername = !!env.PROXY_USERNAME;
       const hasPassword = !!env.PROXY_PASSWORD;
@@ -78,14 +74,10 @@ export default {
       return homeResponse(request);
     }
 
-    // Direct proxy endpoints
     if (url.pathname === "/service" || url.pathname === "/proxy") {
       return handleProxy(request, env);
     }
 
-    // Dynamic Asset & Fallback Routing:
-    // When a page inside the browser loads relative assets (e.g. /load.php, /app.js, /api/...)
-    // resolve against Referer or active target cookie
     return handleFallbackAsset(request, env);
   },
 };
@@ -163,12 +155,10 @@ async function handleLogout(request: Request): Promise<Response> {
 async function handleFallbackAsset(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
-  // 1. Check if ?url= is passed in query
   if (url.searchParams.has("url")) {
     return handleProxy(request, env);
   }
 
-  // 2. Check Referer header
   const referer = request.headers.get("Referer");
   if (referer) {
     try {
@@ -181,7 +171,6 @@ async function handleFallbackAsset(request: Request, env: Env): Promise<Response
     } catch {}
   }
 
-  // 3. Check active target cookie
   const cookies = parseCookies(request);
   const activeTarget = cookies.get(TARGET_COOKIE);
   if (activeTarget) {
@@ -215,7 +204,6 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
   try {
     const targetParsed = new URL(validatedTarget);
 
-    // Filter and prepare headers to send upstream
     const forwardHeaders = new Headers();
     for (const [key, value] of request.headers.entries()) {
       const lowerKey = key.toLowerCase();
@@ -272,7 +260,7 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
     headers.delete("content-length");
     headers.delete("transfer-encoding");
 
-    // Remove security headers that prevent framing and script execution
+    // Remove security and framing headers
     headers.delete("x-frame-options");
     headers.delete("content-security-policy");
     headers.delete("content-security-policy-report-only");
@@ -282,19 +270,16 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
     headers.delete("strict-transport-security");
     headers.delete("permissions-policy");
 
-    // Add open CORS headers
     headers.set("Access-Control-Allow-Origin", "*");
     headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD");
     headers.set("Access-Control-Allow-Headers", "*");
     headers.set("X-Content-Type-Options", "nosniff");
 
-    // Set cookie tracking the active upstream origin
     headers.append(
       "Set-Cookie",
       serializeCookie(TARGET_COOKIE, targetParsed.origin, SESSION_TTL_SECONDS, false, request),
     );
 
-    // Handle HTTP Redirects (301, 302, 303, 307, 308)
     const location = upstreamResponse.headers.get("Location");
     if (location && upstreamResponse.status >= 300 && upstreamResponse.status < 400) {
       try {
@@ -303,14 +288,11 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
         if (safeRedirect) {
           headers.set("Location", `/service?url=${encodeURIComponent(safeRedirect)}`);
         }
-      } catch {
-        // Leave location header as-is if unresolvable
-      }
+      } catch {}
     }
 
     const contentType = (headers.get("Content-Type") || "").toLowerCase();
 
-    // Rewrite HTML responses
     if (contentType.includes("text/html")) {
       const baseResponse = new Response(upstreamResponse.body, {
         status: upstreamResponse.status,
@@ -320,7 +302,6 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
       return rewriteHtml(baseResponse, validatedTarget);
     }
 
-    // Rewrite CSS responses
     if (contentType.includes("text/css")) {
       const cssText = await upstreamResponse.text();
       const rewrittenCss = rewriteCss(cssText, validatedTarget);
@@ -405,21 +386,10 @@ function rewriteCss(cssText: string, baseUrl: string): string {
 }
 
 function rewriteHtml(response: Response, targetUrl: string): Response {
-  const targetParsed = new URL(targetUrl);
-  const baseTag = `<base href="${targetUrl}">`;
-
   const clientHookScript = `<script id="__client_nav_hook__">
 (function() {
   const currentTarget = ${JSON.stringify(targetUrl)};
-  const currentOrigin = ${JSON.stringify(targetParsed.origin)};
   const endpoint = '/service?url=';
-
-  // Disable ServiceWorker registration cleanly to prevent worker scope conflicts
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register = function() {
-      return Promise.reject(new Error('ServiceWorker not supported in container'));
-    };
-  }
 
   function toRouted(rawUrl) {
     if (!rawUrl) return rawUrl;
@@ -447,7 +417,6 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     } catch(e) {}
   }
 
-  // Intercept click on links
   document.addEventListener('click', function(e) {
     let el = e.target;
     while (el && el.tagName !== 'A') {
@@ -473,7 +442,6 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     }
   }, true);
 
-  // Intercept form submissions
   document.addEventListener('submit', function(e) {
     const form = e.target;
     if (!form || form.tagName !== 'FORM') return;
@@ -483,7 +451,6 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     } catch(err) {}
   }, true);
 
-  // Intercept window.open
   const origOpen = window.open;
   window.open = function(url, target, features) {
     if (!url) return null;
@@ -499,7 +466,6 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     }
   };
 
-  // Intercept SPA navigation (pushState / replaceState)
   const origPushState = history.pushState;
   history.pushState = function(state, unused, url) {
     if (url) {
@@ -522,7 +488,6 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     return origReplaceState.apply(this, arguments);
   };
 
-  // Intercept fetch
   const origFetch = window.fetch;
   window.fetch = function(input, init) {
     try {
@@ -535,7 +500,6 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     return origFetch.call(this, input, init);
   };
 
-  // Intercept XMLHttpRequest
   const origXhrOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url, ...rest) {
     try {
@@ -556,7 +520,7 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
   const rewriter = new HTMLRewriter()
     .on("head", {
       element(element) {
-        element.prepend(baseTag + clientHookScript, { html: true });
+        element.prepend(clientHookScript, { html: true });
       },
     })
     .on("a", {
@@ -585,6 +549,8 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
         if (href) {
           element.setAttribute("href", resolveProxiedUrl(href, targetUrl));
         }
+        element.removeAttribute("integrity");
+        element.removeAttribute("crossorigin");
       },
     })
     .on("script", {
@@ -593,6 +559,9 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
         if (src) {
           element.setAttribute("src", resolveProxiedUrl(src, targetUrl));
         }
+        element.removeAttribute("integrity");
+        element.removeAttribute("crossorigin");
+        element.removeAttribute("nonce");
       },
     })
     .on("img", {
@@ -605,6 +574,8 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
         if (srcset) {
           element.setAttribute("srcset", rewriteSrcset(srcset, targetUrl));
         }
+        element.removeAttribute("integrity");
+        element.removeAttribute("crossorigin");
       },
     })
     .on("source", {
@@ -663,9 +634,7 @@ function parseAllowlist(allowlist: string): URL[] {
       try {
         const normalized = /^[a-zA-Z][a-zA-Z0-9+.-]*:/i.test(trimmed) ? trimmed : `https://${trimmed}`;
         entries.push(new URL(normalized));
-      } catch {
-        // Invalid allowlist entries ignored
-      }
+      } catch {}
     }
   }
 
@@ -891,257 +860,439 @@ function loginPage(csrf: string, env: Env): string {
 function homePage(csrf: string): string {
   return page(
     "",
-    `<div class="app-container">
-    <div class="tabs-bar">
-      <div class="tabs" id="tab-list" role="tablist"></div>
-      <button id="new-tab-btn" class="new-tab-btn" type="button" title="New Tab" aria-label="New Tab">+</button>
+    `<div class="chrome-window">
+    <!-- Top Tab Strip -->
+    <div class="chrome-tabstrip">
+      <div class="tabs-container" id="tabs-container"></div>
+      <button class="new-tab-btn" id="new-tab-btn" title="New Tab" aria-label="New Tab">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <div class="window-controls">
+        <div class="win-btn win-min" title="Minimize">&#x2014;</div>
+        <div class="win-btn win-max" title="Maximize">&#x25A2;</div>
+        <div class="win-btn win-close" title="Close">&#x2715;</div>
+      </div>
     </div>
-    <div class="toolbar">
-      <div class="nav-buttons">
-        <button class="icon-button" id="back" type="button" title="Back" aria-label="Back">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+
+    <!-- Chromium Navigation Toolbar -->
+    <div class="chrome-toolbar">
+      <div class="nav-controls">
+        <button class="tool-btn" id="btn-back" title="Click to go back" disabled>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
         </button>
-        <button class="icon-button" id="forward" type="button" title="Forward" aria-label="Forward">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+        <button class="tool-btn" id="btn-forward" title="Click to go forward" disabled>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
         </button>
-        <button class="icon-button" id="refresh" type="button" title="Reload" aria-label="Reload">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-        </button>
-        <button class="icon-button" id="home" type="button" title="Home" aria-label="Home">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+        <button class="tool-btn" id="btn-reload" title="Reload this page">
+          <svg id="icon-reload" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
         </button>
       </div>
-      <form id="address-form" class="address-form">
-        <div class="address-input-wrapper">
-          <input id="address" type="text" placeholder="Search or enter URL..." autocomplete="off" spellcheck="false" required>
-          <div id="loader" class="loader hidden"></div>
+
+      <!-- Omnibox (Address Bar) -->
+      <div class="omnibox-wrapper">
+        <div class="omnibox" id="omnibox-container">
+          <div class="omnibox-leading-icon">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </div>
+          <form id="url-form" class="url-form">
+            <input id="omnibox-input" type="text" placeholder="Search DuckDuckGo or type a URL" autocomplete="off" spellcheck="false" required>
+          </form>
+          <div class="omnibox-trailing-icon" id="btn-bookmark" title="Bookmark this tab">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+          </div>
         </div>
-        <button type="submit" class="btn-go">Go</button>
-      </form>
-      <div class="toolbar-actions">
-        <form method="post" action="/logout" style="margin:0;">
-          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-          <button type="submit" class="signout-btn" title="Sign out">Sign out</button>
-        </form>
+      </div>
+
+      <!-- Right Menu Actions -->
+      <div class="menu-controls">
+        <button class="tool-btn" id="btn-menu" title="Customize and control">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
+        </button>
+        <div class="chrome-menu hidden" id="chrome-dropdown">
+          <div class="menu-item" id="menu-new-tab"><span>New tab</span><span class="menu-shortcut">Ctrl+T</span></div>
+          <div class="menu-item" id="menu-reload"><span>Reload</span><span class="menu-shortcut">Ctrl+R</span></div>
+          <div class="menu-divider"></div>
+          <form method="post" action="/logout" style="margin:0;">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+            <button type="submit" class="menu-item-btn"><span>Sign out</span></button>
+          </form>
+        </div>
       </div>
     </div>
-    <div class="viewport-container">
-      <iframe id="viewport" title="Viewport" allow="fullscreen; clipboard-read; clipboard-write; microphone; camera; midi; encrypted-media; autodiscovery" referrerpolicy="no-referrer"></iframe>
+
+    <!-- Bookmarks Bar -->
+    <div class="chrome-bookmarks">
+      <button type="button" class="bookmark-chip" data-url="https://duckduckgo.com">
+        <span class="bm-icon">🦆</span> DuckDuckGo
+      </button>
+      <button type="button" class="bookmark-chip" data-url="https://en.wikipedia.org">
+        <span class="bm-icon">📖</span> Wikipedia
+      </button>
+      <button type="button" class="bookmark-chip" data-url="https://github.com">
+        <span class="bm-icon">🐙</span> GitHub
+      </button>
+      <button type="button" class="bookmark-chip" data-url="https://discord.com">
+        <span class="bm-icon">💬</span> Discord
+      </button>
+      <button type="button" class="bookmark-chip" data-url="https://news.ycombinator.com">
+        <span class="bm-icon">🟧</span> Hacker News
+      </button>
+      <button type="button" class="bookmark-chip" data-url="https://reddit.com">
+        <span class="bm-icon">🔴</span> Reddit
+      </button>
     </div>
+
+    <!-- Multi-Viewport Container -->
+    <div class="viewports-deck" id="viewports-deck"></div>
   </div>
+
   <script>
   (() => {
-    const tabs = [];
-    let activeIndex = -1;
-    const tabList = document.getElementById('tab-list');
-    const viewport = document.getElementById('viewport');
-    const address = document.getElementById('address');
-    const form = document.getElementById('address-form');
-    const backBtn = document.getElementById('back');
-    const forwardBtn = document.getElementById('forward');
-    const refreshBtn = document.getElementById('refresh');
-    const homeBtn = document.getElementById('home');
+    let tabs = [];
+    let activeId = null;
+    let tabIdCounter = 1;
+
+    const tabsContainer = document.getElementById('tabs-container');
+    const viewportsDeck = document.getElementById('viewports-deck');
+    const omniboxInput = document.getElementById('omnibox-input');
+    const urlForm = document.getElementById('url-form');
+    const btnBack = document.getElementById('btn-back');
+    const btnForward = document.getElementById('btn-forward');
+    const btnReload = document.getElementById('btn-reload');
     const newTabBtn = document.getElementById('new-tab-btn');
-    const loader = document.getElementById('loader');
+    const btnMenu = document.getElementById('btn-menu');
+    const chromeDropdown = document.getElementById('chrome-dropdown');
 
     function formatInputToUrl(input) {
       const trimmed = input.trim();
-      if (!trimmed) return 'https://duckduckgo.com/html/';
+      if (!trimmed) return 'https://duckduckgo.com';
       if (/^https?:\\/\\//i.test(trimmed)) return trimmed;
       if (!/\\s/.test(trimmed) && trimmed.includes('.')) {
         return 'https://' + trimmed;
       }
-      return 'https://duckduckgo.com/html/?q=' + encodeURIComponent(trimmed);
+      return 'https://duckduckgo.com/?q=' + encodeURIComponent(trimmed);
     }
 
-    function renderTabs() {
-      tabList.innerHTML = '';
-      tabs.forEach((tab, index) => {
-        const tabEl = document.createElement('div');
-        tabEl.className = 'tab' + (index === activeIndex ? ' active' : '');
-        tabEl.setAttribute('role', 'tab');
-        
-        const titleSpan = document.createElement('span');
-        titleSpan.className = 'tab-title';
-        titleSpan.textContent = tab.title || 'New Tab';
-        titleSpan.onclick = () => selectTab(index);
-        
-        const closeBtn = document.createElement('button');
-        closeBtn.className = 'tab-close';
-        closeBtn.type = 'button';
-        closeBtn.innerHTML = '&times;';
-        closeBtn.title = 'Close tab';
-        closeBtn.onclick = (e) => {
-          e.stopPropagation();
-          closeTab(index);
-        };
-
-        tabEl.appendChild(titleSpan);
-        if (tabs.length > 1) {
-          tabEl.appendChild(closeBtn);
-        }
-        tabList.appendChild(tabEl);
-      });
-    }
-
-    function selectTab(index) {
-      if (index < 0 || index >= tabs.length) return;
-      activeIndex = index;
-      const tab = tabs[activeIndex];
-      address.value = tab.url || '';
-      
-      if (tab.url) {
-        showLoader();
-        viewport.src = '/service?url=' + encodeURIComponent(tab.url);
-      } else {
-        hideLoader();
-        viewport.src = 'about:blank';
-      }
-      renderTabs();
-      updateButtons();
-    }
-
-    function addTab(initialUrl = '') {
-      const tab = {
-        title: initialUrl ? extractHost(initialUrl) : 'New Tab',
-        url: initialUrl,
-        history: initialUrl ? [initialUrl] : [],
-        cursor: initialUrl ? 0 : -1
-      };
-      tabs.push(tab);
-      selectTab(tabs.length - 1);
-      if (!initialUrl) {
-        address.focus();
-        address.select();
-      }
-    }
-
-    function closeTab(index) {
-      if (tabs.length <= 1) return;
-      tabs.splice(index, 1);
-      if (activeIndex >= tabs.length) {
-        activeIndex = tabs.length - 1;
-      }
-      selectTab(activeIndex);
-    }
-
-    function extractHost(urlStr) {
+    function extractDomain(urlStr) {
+      if (!urlStr) return 'New Tab';
       try {
         const u = new URL(urlStr);
         return u.hostname || urlStr;
       } catch {
-        return urlStr || 'New Tab';
+        return urlStr;
       }
     }
 
-    function navigate(rawInput, replace = false) {
+    function createTab(initialUrl = '') {
+      const id = 'tab-' + (tabIdCounter++);
+      const url = initialUrl ? formatInputToUrl(initialUrl) : '';
+      const tab = {
+        id: id,
+        title: url ? extractDomain(url) : 'New Tab',
+        url: url,
+        history: url ? [url] : [],
+        cursor: url ? 0 : -1,
+        isLoading: false
+      };
+
+      const viewportEl = document.createElement('div');
+      viewportEl.className = 'tab-viewport';
+      viewportEl.id = 'viewport-' + id;
+
+      const iframe = document.createElement('iframe');
+      iframe.className = 'tab-frame';
+      iframe.setAttribute('allow', 'fullscreen; clipboard-read; clipboard-write; microphone; camera; midi; encrypted-media; autodiscovery');
+      iframe.setAttribute('referrerpolicy', 'no-referrer');
+      
+      iframe.onload = () => {
+        tab.isLoading = false;
+        updateToolbarState();
+      };
+
+      viewportEl.appendChild(iframe);
+      viewportsDeck.appendChild(viewportEl);
+
+      tabs.push(tab);
+
+      if (url) {
+        navigateTab(tab, url, false);
+      } else {
+        renderNewTabPage(viewportEl, tab);
+      }
+
+      selectTab(id);
+      if (!initialUrl) {
+        omniboxInput.focus();
+        omniboxInput.select();
+      }
+    }
+
+    function renderNewTabPage(viewportEl, tab) {
+      const iframe = viewportEl.querySelector('.tab-frame');
+      if (iframe) iframe.style.display = 'none';
+
+      let ntp = viewportEl.querySelector('.ntp-container');
+      if (!ntp) {
+        ntp = document.createElement('div');
+        ntp.className = 'ntp-container';
+        ntp.innerHTML = \`
+          <div class="ntp-center">
+            <div class="ntp-search-box">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+              <input type="text" class="ntp-input" placeholder="Search DuckDuckGo or type a URL" autofocus>
+            </div>
+            <div class="ntp-grid">
+              <div class="ntp-tile" data-url="https://duckduckgo.com"><div class="ntp-icon">🦆</div><div class="ntp-title">DuckDuckGo</div></div>
+              <div class="ntp-tile" data-url="https://en.wikipedia.org"><div class="ntp-icon">📖</div><div class="ntp-title">Wikipedia</div></div>
+              <div class="ntp-tile" data-url="https://github.com"><div class="ntp-icon">🐙</div><div class="ntp-title">GitHub</div></div>
+              <div class="ntp-tile" data-url="https://discord.com"><div class="ntp-icon">💬</div><div class="ntp-title">Discord</div></div>
+              <div class="ntp-tile" data-url="https://news.ycombinator.com"><div class="ntp-icon">🟧</div><div class="ntp-title">Hacker News</div></div>
+              <div class="ntp-tile" data-url="https://reddit.com"><div class="ntp-icon">🔴</div><div class="ntp-title">Reddit</div></div>
+            </div>
+          </div>
+        \`;
+        viewportEl.appendChild(ntp);
+
+        const ntpInput = ntp.querySelector('.ntp-input');
+        ntpInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            navigateTab(tab, ntpInput.value, false);
+          }
+        });
+
+        ntp.querySelectorAll('.ntp-tile').forEach((tile) => {
+          tile.addEventListener('click', () => {
+            const u = tile.getAttribute('data-url');
+            if (u) navigateTab(tab, u, false);
+          });
+        });
+      }
+      ntp.style.display = 'flex';
+    }
+
+    function selectTab(id) {
+      activeId = id;
+      const activeTab = tabs.find(t => t.id === id);
+      if (!activeTab) return;
+
+      document.querySelectorAll('.tab-viewport').forEach((vp) => {
+        vp.style.display = vp.id === ('viewport-' + id) ? 'block' : 'none';
+      });
+
+      omniboxInput.value = activeTab.url || '';
+      renderTabs();
+      updateToolbarState();
+    }
+
+    function closeTab(id) {
+      const index = tabs.findIndex(t => t.id === id);
+      if (index === -1) return;
+
+      const vp = document.getElementById('viewport-' + id);
+      if (vp) vp.remove();
+
+      tabs.splice(index, 1);
+
+      if (tabs.length === 0) {
+        createTab('');
+        return;
+      }
+
+      if (activeId === id) {
+        const nextIndex = Math.min(index, tabs.length - 1);
+        selectTab(tabs[nextIndex].id);
+      } else {
+        renderTabs();
+      }
+    }
+
+    function navigateTab(tab, rawInput, replace = false) {
       const url = formatInputToUrl(rawInput);
-      const tab = tabs[activeIndex];
-      if (!tab) return;
+      const viewportEl = document.getElementById('viewport-' + tab.id);
+      if (!viewportEl) return;
+
+      const ntp = viewportEl.querySelector('.ntp-container');
+      if (ntp) ntp.style.display = 'none';
+
+      const iframe = viewportEl.querySelector('.tab-frame');
+      if (iframe) {
+        iframe.style.display = 'block';
+        tab.isLoading = true;
+        iframe.src = '/service?url=' + encodeURIComponent(url);
+      }
 
       tab.url = url;
-      tab.title = extractHost(url);
+      tab.title = extractDomain(url);
       if (!replace) {
         tab.history = tab.history.slice(0, tab.cursor + 1);
         tab.history.push(url);
         tab.cursor = tab.history.length - 1;
       }
 
-      address.value = url;
-      showLoader();
-      viewport.src = '/service?url=' + encodeURIComponent(url);
+      if (tab.id === activeId) {
+        omniboxInput.value = url;
+      }
+
       renderTabs();
-      updateButtons();
+      updateToolbarState();
     }
 
-    function updateButtons() {
-      const tab = tabs[activeIndex];
-      backBtn.disabled = !tab || tab.cursor <= 0;
-      forwardBtn.disabled = !tab || tab.cursor >= tab.history.length - 1;
+    function renderTabs() {
+      tabsContainer.innerHTML = '';
+      tabs.forEach((tab) => {
+        const tabEl = document.createElement('div');
+        tabEl.className = 'chrome-tab' + (tab.id === activeId ? ' active' : '');
+        tabEl.title = tab.title;
+
+        tabEl.innerHTML = \`
+          <div class="tab-favicon">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          </div>
+          <span class="tab-label">\${escapeHtml(tab.title)}</span>
+          <button class="tab-close-btn" type="button" title="Close tab">&times;</button>
+        \`;
+
+        tabEl.addEventListener('click', (e) => {
+          if (!e.target.classList.contains('tab-close-btn')) {
+            selectTab(tab.id);
+          }
+        });
+
+        const closeBtn = tabEl.querySelector('.tab-close-btn');
+        closeBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          closeTab(tab.id);
+        });
+
+        tabEl.addEventListener('auxclick', (e) => {
+          if (e.button === 1) {
+            e.preventDefault();
+            closeTab(tab.id);
+          }
+        });
+
+        tabsContainer.appendChild(tabEl);
+      });
     }
 
-    function showLoader() {
-      loader.classList.remove('hidden');
+    function updateToolbarState() {
+      const tab = tabs.find(t => t.id === activeId);
+      if (!tab) return;
+
+      btnBack.disabled = tab.cursor <= 0;
+      btnForward.disabled = tab.cursor >= tab.history.length - 1;
     }
 
-    function hideLoader() {
-      loader.classList.add('hidden');
+    function escapeHtml(str) {
+      return (str || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] || c);
     }
 
-    viewport.addEventListener('load', () => {
-      hideLoader();
-    });
+    newTabBtn.addEventListener('click', () => createTab(''));
 
-    form.addEventListener('submit', (e) => {
+    urlForm.addEventListener('submit', (e) => {
       e.preventDefault();
-      navigate(address.value, false);
-    });
-
-    backBtn.addEventListener('click', () => {
-      const tab = tabs[activeIndex];
-      if (!tab || tab.cursor <= 0) return;
-      tab.cursor -= 1;
-      tab.url = tab.history[tab.cursor];
-      tab.title = extractHost(tab.url);
-      address.value = tab.url;
-      showLoader();
-      viewport.src = '/service?url=' + encodeURIComponent(tab.url);
-      renderTabs();
-      updateButtons();
-    });
-
-    forwardBtn.addEventListener('click', () => {
-      const tab = tabs[activeIndex];
-      if (!tab || tab.cursor >= tab.history.length - 1) return;
-      tab.cursor += 1;
-      tab.url = tab.history[tab.cursor];
-      tab.title = extractHost(tab.url);
-      address.value = tab.url;
-      showLoader();
-      viewport.src = '/service?url=' + encodeURIComponent(tab.url);
-      renderTabs();
-      updateButtons();
-    });
-
-    refreshBtn.addEventListener('click', () => {
-      const tab = tabs[activeIndex];
-      if (tab && tab.url) {
-        showLoader();
-        viewport.src = '/service?url=' + encodeURIComponent(tab.url);
+      const tab = tabs.find(t => t.id === activeId);
+      if (tab) {
+        navigateTab(tab, omniboxInput.value, false);
       }
     });
 
-    homeBtn.addEventListener('click', () => {
-      navigate('https://duckduckgo.com/html/', false);
+    omniboxInput.addEventListener('focus', () => omniboxInput.select());
+
+    btnBack.addEventListener('click', () => {
+      const tab = tabs.find(t => t.id === activeId);
+      if (!tab || tab.cursor <= 0) return;
+      tab.cursor--;
+      navigateTab(tab, tab.history[tab.cursor], true);
     });
 
-    newTabBtn.addEventListener('click', () => addTab());
+    btnForward.addEventListener('click', () => {
+      const tab = tabs.find(t => t.id === activeId);
+      if (!tab || tab.cursor >= tab.history.length - 1) return;
+      tab.cursor++;
+      navigateTab(tab, tab.history[tab.cursor], true);
+    });
+
+    btnReload.addEventListener('click', () => {
+      const tab = tabs.find(t => t.id === activeId);
+      if (tab && tab.url) {
+        navigateTab(tab, tab.url, true);
+      }
+    });
+
+    btnMenu.addEventListener('click', (e) => {
+      e.stopPropagation();
+      chromeDropdown.classList.toggle('hidden');
+    });
+
+    document.addEventListener('click', () => {
+      chromeDropdown.classList.add('hidden');
+    });
+
+    document.getElementById('menu-new-tab').addEventListener('click', () => {
+      createTab('');
+      chromeDropdown.classList.add('hidden');
+    });
+
+    document.getElementById('menu-reload').addEventListener('click', () => {
+      const tab = tabs.find(t => t.id === activeId);
+      if (tab && tab.url) navigateTab(tab, tab.url, true);
+      chromeDropdown.classList.add('hidden');
+    });
+
+    document.querySelectorAll('.bookmark-chip').forEach((chip) => {
+      chip.addEventListener('click', () => {
+        const u = chip.getAttribute('data-url');
+        if (u) {
+          const tab = tabs.find(t => t.id === activeId);
+          if (tab) navigateTab(tab, u, false);
+        }
+      });
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 't') {
+        e.preventDefault();
+        createTab('');
+      } else if ((e.ctrlKey || e.metaKey) && e.key === 'w') {
+        e.preventDefault();
+        if (activeId) closeTab(activeId);
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === 'l' || e.key === 'e')) {
+        e.preventDefault();
+        omniboxInput.focus();
+        omniboxInput.select();
+      } else if ((e.ctrlKey || e.metaKey) && e.key === 'r') {
+        e.preventDefault();
+        const tab = tabs.find(t => t.id === activeId);
+        if (tab && tab.url) navigateTab(tab, tab.url, true);
+      }
+    });
 
     window.addEventListener('message', (event) => {
       if (!event.data) return;
       if (event.data.type === 'client_navigated') {
-        const tab = tabs[activeIndex];
+        const tab = tabs.find(t => t.id === activeId);
         if (tab && event.data.url) {
           tab.url = event.data.url;
-          if (event.data.title) {
-            tab.title = event.data.title;
-          }
+          if (event.data.title) tab.title = event.data.title;
           if (tab.history[tab.cursor] !== event.data.url) {
             tab.history = tab.history.slice(0, tab.cursor + 1);
             tab.history.push(event.data.url);
             tab.cursor = tab.history.length - 1;
           }
-          address.value = tab.url;
+          if (tab.id === activeId) {
+            omniboxInput.value = tab.url;
+          }
           renderTabs();
-          updateButtons();
-          hideLoader();
+          updateToolbarState();
         }
       } else if (event.data.type === 'client_open_tab' && event.data.url) {
-        addTab(event.data.url);
+        createTab(event.data.url);
       }
     });
 
-    addTab('https://duckduckgo.com/html/');
+    createTab('https://duckduckgo.com');
   })();
   </script>`,
   );
@@ -1157,39 +1308,42 @@ function page(title: string, body: string): string {
   <title>${pageTitle}</title>
   <style>
     :root {
-      --bg-root: #0a0a0a;
-      --bg-surface: #141414;
-      --bg-card: #171717;
-      --bg-input: #1f1f1f;
-      --border-subtle: #262626;
-      --border-hover: #404040;
-      --text-main: #ededed;
-      --text-muted: #737373;
-      --btn-bg: #222222;
-      --btn-hover: #2e2e2e;
-      --tab-active: #141414;
-      --tab-inactive: #0a0a0a;
+      --cr-bg: #202124;
+      --cr-tabstrip-bg: #1f1f23;
+      --cr-toolbar-bg: #28292a;
+      --cr-omnibox-bg: #1e1f22;
+      --cr-omnibox-focus-bg: #17181a;
+      --cr-tab-active-bg: #28292a;
+      --cr-tab-hover-bg: #262729;
+      --cr-text-primary: #e8eaed;
+      --cr-text-secondary: #9aa0a6;
+      --cr-border: #3c4043;
+      --cr-btn-hover: #35363a;
+      --cr-btn-active: #3c4043;
+      --cr-accent: #8ab4f8;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      background: var(--bg-root);
-      color: var(--text-main);
+      font-family: Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      background: var(--cr-bg);
+      color: var(--cr-text-primary);
       height: 100vh;
       overflow: hidden;
+      user-select: none;
       -webkit-font-smoothing: antialiased;
     }
+
     .login-wrapper {
       display: flex;
       align-items: center;
       justify-content: center;
       height: 100vh;
       width: 100vw;
-      background: var(--bg-root);
+      background: #0a0a0a;
     }
     .login-modal {
-      background: var(--bg-card);
-      border: 1px solid var(--border-subtle);
+      background: #171717;
+      border: 1px solid #262626;
       border-radius: 10px;
       box-shadow: 0 10px 40px rgba(0,0,0,0.8);
       padding: 32px 28px;
@@ -1204,27 +1358,27 @@ function page(title: string, body: string): string {
     .login-modal input {
       width: 100%;
       padding: 12px 14px;
-      background: var(--bg-input);
-      border: 1px solid var(--border-subtle);
+      background: #1f1f1f;
+      border: 1px solid #262626;
       border-radius: 6px;
-      color: var(--text-main);
+      color: #ededed;
       font-size: 14px;
       transition: border-color 0.15s, background 0.15s;
     }
     .login-modal input:focus {
       outline: none;
-      border-color: var(--border-hover);
+      border-color: #404040;
       background: #242424;
     }
     .login-modal input::placeholder {
-      color: var(--text-muted);
+      color: #737373;
     }
     .btn-primary {
       width: 100%;
       padding: 12px;
-      background: var(--btn-bg);
-      border: 1px solid var(--border-subtle);
-      color: var(--text-main);
+      background: #222222;
+      border: 1px solid #262626;
+      color: #ededed;
       border-radius: 6px;
       font-weight: 500;
       font-size: 14px;
@@ -1233,182 +1387,396 @@ function page(title: string, body: string): string {
       margin-top: 4px;
     }
     .btn-primary:hover {
-      background: var(--btn-hover);
-      border-color: var(--border-hover);
+      background: #2e2e2e;
+      border-color: #404040;
     }
 
-    .app-container {
+    .chrome-window {
       display: flex;
       flex-direction: column;
       height: 100vh;
-      background: var(--bg-surface);
+      background: var(--cr-toolbar-bg);
     }
-    .tabs-bar {
+
+    .chrome-tabstrip {
       display: flex;
-      align-items: center;
-      background: var(--bg-root);
-      padding: 6px 8px 0;
-      gap: 3px;
-      border-bottom: 1px solid var(--border-subtle);
-      user-select: none;
+      align-items: flex-end;
+      height: 40px;
+      background: var(--cr-tabstrip-bg);
+      padding: 6px 8px 0 8px;
+      position: relative;
     }
-    .tabs {
+    .tabs-container {
       display: flex;
-      gap: 3px;
+      gap: 2px;
       overflow-x: auto;
       flex: 1;
+      height: 100%;
       scrollbar-width: none;
     }
-    .tabs::-webkit-scrollbar { display: none; }
-    .tab {
+    .tabs-container::-webkit-scrollbar { display: none; }
+    .chrome-tab {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 7px 12px;
-      background: var(--tab-inactive);
-      color: var(--text-muted);
-      border-radius: 6px 6px 0 0;
+      height: 34px;
+      min-width: 140px;
+      max-width: 240px;
+      padding: 0 10px 0 12px;
+      border-radius: 8px 8px 0 0;
+      background: transparent;
+      color: var(--cr-text-secondary);
       font-size: 12px;
-      max-width: 180px;
       cursor: pointer;
-      border: 1px solid transparent;
-      border-bottom: none;
-      transition: all 0.15s;
+      position: relative;
+      transition: background 0.1s, color 0.1s;
     }
-    .tab:hover { background: #171717; color: #d4d4d4; }
-    .tab.active {
-      background: var(--tab-active);
-      color: #fafafa;
-      border-color: var(--border-subtle);
+    .chrome-tab:hover:not(.active) {
+      background: var(--cr-tab-hover-bg);
+      color: var(--cr-text-primary);
     }
-    .tab-title {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      flex: 1;
+    .chrome-tab.active {
+      background: var(--cr-tab-active-bg);
+      color: var(--cr-text-primary);
+      font-weight: 500;
     }
-    .tab-close {
-      background: transparent;
-      border: none;
-      color: var(--text-muted);
-      cursor: pointer;
-      font-size: 14px;
-      line-height: 1;
-      padding: 1px 3px;
-      border-radius: 3px;
-    }
-    .tab-close:hover { background: #333333; color: #fff; }
-    .new-tab-btn {
-      background: transparent;
-      border: none;
-      color: var(--text-muted);
-      font-size: 16px;
-      cursor: pointer;
-      padding: 4px 8px;
-      border-radius: 4px;
-      margin-bottom: 2px;
-    }
-    .new-tab-btn:hover { background: #171717; color: #fff; }
-
-    .toolbar {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 10px;
-      background: var(--bg-surface);
-      border-bottom: 1px solid var(--border-subtle);
-    }
-    .nav-buttons { display: flex; gap: 2px; align-items: center; }
-    .icon-button {
-      background: transparent;
-      border: none;
-      color: var(--text-muted);
-      cursor: pointer;
-      padding: 6px 7px;
-      border-radius: 4px;
+    .tab-favicon {
       display: flex;
       align-items: center;
       justify-content: center;
+      opacity: 0.8;
+      flex-shrink: 0;
     }
-    .icon-button:hover:not(:disabled) { background: #262626; color: #fff; }
-    .icon-button:disabled { opacity: 0.2; cursor: not-allowed; }
+    .tab-label {
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-size: 12px;
+    }
+    .tab-close-btn {
+      background: transparent;
+      border: none;
+      color: var(--cr-text-secondary);
+      cursor: pointer;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      line-height: 1;
+      opacity: 0.7;
+    }
+    .tab-close-btn:hover {
+      background: #474a4f;
+      color: #fff;
+      opacity: 1;
+    }
+    .new-tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--cr-text-secondary);
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      margin-left: 6px;
+      margin-bottom: 3px;
+    }
+    .new-tab-btn:hover {
+      background: var(--cr-btn-hover);
+      color: var(--cr-text-primary);
+    }
 
-    .address-form {
+    .window-controls {
       display: flex;
-      flex: 1;
+      align-items: center;
+      margin-left: auto;
+      height: 100%;
+      margin-bottom: 4px;
+    }
+    .win-btn {
+      width: 38px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      color: var(--cr-text-secondary);
+      cursor: pointer;
+    }
+    .win-btn:hover { background: var(--cr-btn-hover); color: #fff; }
+    .win-close:hover { background: #e81123; color: #fff; }
+
+    .chrome-toolbar {
+      display: flex;
+      align-items: center;
+      height: 44px;
+      background: var(--cr-toolbar-bg);
+      padding: 0 8px;
       gap: 6px;
-      align-items: center;
+      border-bottom: 1px solid #1e1f22;
     }
-    .address-input-wrapper {
-      position: relative;
+    .nav-controls {
       display: flex;
       align-items: center;
-      flex: 1;
+      gap: 2px;
     }
-    #address {
+    .tool-btn {
+      background: transparent;
+      border: none;
+      color: var(--cr-text-secondary);
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: background 0.1s, color 0.1s;
+    }
+    .tool-btn:hover:not(:disabled) {
+      background: var(--cr-btn-hover);
+      color: var(--cr-text-primary);
+    }
+    .tool-btn:disabled {
+      opacity: 0.3;
+      cursor: default;
+    }
+
+    .omnibox-wrapper {
+      flex: 1;
+      display: flex;
+      align-items: center;
+    }
+    .omnibox {
+      display: flex;
+      align-items: center;
       width: 100%;
-      padding: 6px 30px 6px 12px;
-      background: var(--bg-input);
-      border: 1px solid var(--border-subtle);
-      border-radius: 6px;
-      color: var(--text-main);
+      height: 32px;
+      background: var(--cr-omnibox-bg);
+      border-radius: 20px;
+      padding: 0 12px;
+      transition: background 0.15s, box-shadow 0.15s;
+    }
+    .omnibox:focus-within {
+      background: var(--cr-omnibox-focus-bg);
+      box-shadow: 0 0 0 2px var(--cr-accent);
+    }
+    .omnibox-leading-icon {
+      color: var(--cr-text-secondary);
+      display: flex;
+      align-items: center;
+      margin-right: 8px;
+      opacity: 0.8;
+    }
+    .url-form {
+      flex: 1;
+      display: flex;
+      align-items: center;
+    }
+    #omnibox-input {
+      width: 100%;
+      background: transparent;
+      border: none;
+      color: var(--cr-text-primary);
       font-size: 13px;
+      outline: none;
       font-family: inherit;
     }
-    #address:focus {
-      outline: none;
-      border-color: var(--border-hover);
-      background: #242424;
+    #omnibox-input::placeholder {
+      color: var(--cr-text-secondary);
     }
-    #address::placeholder {
-      color: var(--text-muted);
-    }
-    .btn-go {
-      padding: 6px 12px;
-      background: var(--btn-bg);
-      border: 1px solid var(--border-subtle);
-      border-radius: 6px;
-      color: var(--text-main);
-      font-size: 12px;
+    .omnibox-trailing-icon {
+      color: var(--cr-text-secondary);
+      display: flex;
+      align-items: center;
       cursor: pointer;
-    }
-    .btn-go:hover { background: var(--btn-hover); border-color: var(--border-hover); }
-    .signout-btn {
-      padding: 6px 10px;
-      background: transparent;
-      border: 1px solid var(--border-subtle);
-      border-radius: 4px;
-      color: var(--text-muted);
-      font-size: 12px;
-      cursor: pointer;
-    }
-    .signout-btn:hover { background: #262626; color: #d4d4d4; }
-
-    .loader {
-      position: absolute;
-      right: 10px;
-      width: 12px;
-      height: 12px;
-      border: 2px solid #404040;
-      border-top-color: #ededed;
+      padding: 4px;
       border-radius: 50%;
-      animation: spin 0.8s linear infinite;
     }
-    .loader.hidden { display: none; }
-    @keyframes spin { to { transform: rotate(360deg); } }
+    .omnibox-trailing-icon:hover { color: #fff; }
 
-    .viewport-container {
+    .menu-controls {
+      position: relative;
+    }
+    .chrome-menu {
+      position: absolute;
+      top: 36px;
+      right: 0;
+      background: #28292a;
+      border: 1px solid var(--cr-border);
+      border-radius: 8px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+      width: 220px;
+      padding: 6px 0;
+      z-index: 1000;
+    }
+    .chrome-menu.hidden { display: none; }
+    .menu-item, .menu-item-btn {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      padding: 8px 16px;
+      background: transparent;
+      border: none;
+      color: var(--cr-text-primary);
+      font-size: 13px;
+      cursor: pointer;
+      text-align: left;
+      font-family: inherit;
+    }
+    .menu-item:hover, .menu-item-btn:hover {
+      background: var(--cr-btn-hover);
+    }
+    .menu-shortcut {
+      color: var(--cr-text-secondary);
+      font-size: 11px;
+    }
+    .menu-divider {
+      height: 1px;
+      background: var(--cr-border);
+      margin: 4px 0;
+    }
+
+    .chrome-bookmarks {
+      display: flex;
+      align-items: center;
+      height: 30px;
+      background: var(--cr-toolbar-bg);
+      padding: 0 8px;
+      gap: 4px;
+      border-bottom: 1px solid #1c1d1f;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .chrome-bookmarks::-webkit-scrollbar { display: none; }
+    .bookmark-chip {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: transparent;
+      border: none;
+      color: var(--cr-text-secondary);
+      padding: 3px 8px;
+      border-radius: 12px;
+      font-size: 11.5px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .bookmark-chip:hover {
+      background: var(--cr-btn-hover);
+      color: var(--cr-text-primary);
+    }
+    .bm-icon { font-size: 12px; }
+
+    .viewports-deck {
       flex: 1;
       width: 100%;
       position: relative;
       background: #000;
     }
-    #viewport {
+    .tab-viewport {
+      width: 100%;
+      height: 100%;
+      display: none;
+      position: relative;
+    }
+    .tab-frame {
       width: 100%;
       height: 100%;
       border: none;
       display: block;
       background: #fff;
+    }
+
+    .ntp-container {
+      width: 100%;
+      height: 100%;
+      background: #202124;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      user-select: none;
+    }
+    .ntp-center {
+      width: 100%;
+      max-width: 560px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 28px;
+      margin-top: -60px;
+    }
+    .ntp-search-box {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      height: 48px;
+      background: #303134;
+      border-radius: 24px;
+      padding: 0 18px;
+      box-shadow: 0 1px 6px rgba(0,0,0,0.28);
+      gap: 12px;
+      color: var(--cr-text-secondary);
+    }
+    .ntp-search-box:focus-within {
+      background: #3c4043;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    }
+    .ntp-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: #fff;
+      font-size: 15px;
+      outline: none;
+      font-family: inherit;
+    }
+    .ntp-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      width: 100%;
+    }
+    .ntp-tile {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      padding: 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .ntp-tile:hover {
+      background: #303134;
+    }
+    .ntp-icon {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      background: #3c4043;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+    }
+    .ntp-title {
+      font-size: 12px;
+      color: var(--cr-text-primary);
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      width: 100%;
     }
   </style>
 </head>
@@ -1433,9 +1801,7 @@ function parseCookies(request: Request): Map<string, string> {
       if (value) {
         try {
           cookies.set(name, decodeURIComponent(value));
-        } catch {
-          // Ignore malformed cookie values
-        }
+        } catch {}
       }
     }
   }

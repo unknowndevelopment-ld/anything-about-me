@@ -146,4 +146,12 @@ describe("fetch handling and diagnostics", () => {
     );
     expect(res.status).toBe(401);
   });
+
+  it("rewrites redirects safely to proxy format", () => {
+    const rawRedirect = "https://discord.com/login";
+    const validated = validateTarget(rawRedirect, "*");
+    expect(validated).toBe("https://discord.com/login");
+    const proxiedLocation = `/service?url=${encodeURIComponent(validated!)}`;
+    expect(proxiedLocation).toBe("/service?url=https%3A%2F%2Fdiscord.com%2Flogin");
+  });
 });

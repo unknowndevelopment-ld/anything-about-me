@@ -293,6 +293,18 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
     forwardHeaders.set("Origin", targetParsed.origin);
     forwardHeaders.set("Referer", upstreamReferer);
 
+    // Forward client cookies to upstream (filtering out internal proxy cookies)
+    const clientCookies = parseCookies(request);
+    const upstreamCookiePairs: string[] = [];
+    for (const [cName, cVal] of clientCookies.entries()) {
+      if (![SESSION_COOKIE, CSRF_COOKIE, TARGET_COOKIE].includes(cName)) {
+        upstreamCookiePairs.push(`${cName}=${encodeURIComponent(cVal)}`);
+      }
+    }
+    if (upstreamCookiePairs.length > 0) {
+      forwardHeaders.set("Cookie", upstreamCookiePairs.join("; "));
+    }
+
     if (!forwardHeaders.has("User-Agent")) {
       forwardHeaders.set(
         "User-Agent",
@@ -348,9 +360,24 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
     headers.set("Access-Control-Allow-Headers", "*");
     headers.set("X-Content-Type-Options", "nosniff");
 
+    // Rewrite upstream Set-Cookie headers so browser stores them on the proxy domain
+    const rawSetCookies = upstreamResponse.headers.getSetCookie
+      ? upstreamResponse.headers.getSetCookie()
+      : [upstreamResponse.headers.get("Set-Cookie")].filter(Boolean) as string[];
+
+    headers.delete("set-cookie");
+    const isHttps = new URL(request.url).protocol === "https:";
+    for (const sc of rawSetCookies) {
+      const rewritten = sc
+        .replace(/;\s*Domain=[^;]+/gi, "")
+        .replace(/;\s*SameSite=[^;]+/gi, "")
+        .replace(/;\s*Secure/gi, "");
+      headers.append("Set-Cookie", `${rewritten}; SameSite=None${isHttps ? "; Secure" : ""}`);
+    }
+
     headers.append(
       "Set-Cookie",
-      serializeCookie(TARGET_COOKIE, targetParsed.origin, SESSION_TTL_SECONDS, false, request),
+      serializeCookie(TARGET_COOKIE, validatedTarget, SESSION_TTL_SECONDS, false, request),
     );
 
     const location = upstreamResponse.headers.get("Location");
@@ -360,6 +387,10 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
         const safeRedirect = validateTarget(redirectedTarget, env.UPSTREAM_ALLOWLIST);
         if (safeRedirect) {
           headers.set("Location", `/service?url=${encodeURIComponent(safeRedirect)}`);
+          headers.append(
+            "Set-Cookie",
+            serializeCookie(TARGET_COOKIE, safeRedirect, SESSION_TTL_SECONDS, false, request),
+          );
         }
       } catch {}
     }
@@ -487,6 +518,8 @@ function rewriteCss(cssText: string, baseUrl: string): string {
 function rewriteHtml(response: Response, targetUrl: string): Response {
   const clientHookScript = `<script id="__client_nav_hook__">
 (function() {
+  const realParent = window.parent;
+  const realTop = window.top;
   const currentTarget = ${JSON.stringify(targetUrl)};
   const endpoint = '/service?url=';
   let virtualUrl;
@@ -495,6 +528,30 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
   } catch (e) {
     virtualUrl = new URL(window.location.href);
   }
+
+  try {
+    Object.defineProperty(window, 'top', {
+      get: function() { return window.self; },
+      set: function(val) {
+        if (typeof val === 'string' && val) {
+          window.location.href = endpoint + encodeURIComponent(new URL(val, virtualUrl ? virtualUrl.href : currentTarget).href);
+        }
+      },
+      configurable: true
+    });
+  } catch(e) {}
+
+  try {
+    Object.defineProperty(window, 'parent', {
+      get: function() { return window.self; },
+      set: function(val) {
+        if (typeof val === 'string' && val) {
+          window.location.href = endpoint + encodeURIComponent(new URL(val, virtualUrl ? virtualUrl.href : currentTarget).href);
+        }
+      },
+      configurable: true
+    });
+  } catch(e) {}
 
   function decodeEntities(str) {
     if (!str) return str;
@@ -622,8 +679,8 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
 
   function notifyParent(urlOverride) {
     try {
-      if (window.parent && window.parent !== window) {
-        window.parent.postMessage({
+      if (realParent && realParent !== window) {
+        realParent.postMessage({
           type: 'client_navigated',
           url: urlOverride || (virtualUrl ? virtualUrl.href : currentTarget),
           title: document.title || currentTarget,
@@ -1449,8 +1506,8 @@ function homePage(csrf: string): string {
 
       const iframe = document.createElement('iframe');
       iframe.className = 'tab-frame';
-      iframe.setAttribute('allow', 'fullscreen; clipboard-read; clipboard-write; microphone; camera; midi; encrypted-media; autodiscovery');
-      iframe.setAttribute('referrerpolicy', 'no-referrer');
+      iframe.setAttribute('allow', 'fullscreen; clipboard-read; clipboard-write; microphone; camera; midi; encrypted-media; autodiscovery; payment');
+      iframe.setAttribute('referrerpolicy', 'origin-when-cross-origin');
       
       iframe.onload = () => {
         tab.isLoading = false;

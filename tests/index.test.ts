@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import worker, {
   accessDeniedResponse,
+  decodeHtmlEntities,
   extractTargetFromPath,
   isBlockedHostname,
   resolveProxiedUrl,
@@ -66,7 +67,14 @@ describe("target validation and path extraction", () => {
 });
 
 describe("URL and asset rewriting", () => {
-  it("resolves relative and absolute URLs through service endpoint", () => {
+  it("decodes HTML entities in URLs and attributes", () => {
+    expect(decodeHtmlEntities("https://preview.redd.it/test.jpg?width=640&amp;crop=smart&amp;s=abc123")).toBe(
+      "https://preview.redd.it/test.jpg?width=640&crop=smart&s=abc123",
+    );
+    expect(decodeHtmlEntities("&quot;test&quot; &lt;tag&gt; &#39;quote&#39;")).toBe('"test" <tag> \'quote\'');
+  });
+
+  it("resolves relative and absolute URLs through service endpoint including Reddit images", () => {
     expect(resolveProxiedUrl("/about", "https://example.com/sub/page")).toBe(
       "/service?url=https%3A%2F%2Fexample.com%2Fabout",
     );
@@ -78,6 +86,13 @@ describe("URL and asset rewriting", () => {
     );
     expect(resolveProxiedUrl("#section", "https://example.com")).toBe("#section");
     expect(resolveProxiedUrl("javascript:void(0)", "https://example.com")).toBe("javascript:void(0)");
+
+    // Reddit encoded image URLs
+    const rawRedditImg = "https://preview.redd.it/sample.png?width=960&amp;crop=smart&amp;format=pjpg&amp;auto=webp&amp;s=abcdef123456";
+    const resolvedRedditImg = resolveProxiedUrl(rawRedditImg, "https://reddit.com");
+    expect(resolvedRedditImg).toBe(
+      "/service?url=https%3A%2F%2Fpreview.redd.it%2Fsample.png%3Fwidth%3D960%26crop%3Dsmart%26format%3Dpjpg%26auto%3Dwebp%26s%3Dabcdef123456",
+    );
   });
 
   it("rewrites srcset attributes correctly", () => {

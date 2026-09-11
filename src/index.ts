@@ -273,9 +273,25 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
       forwardHeaders.set(key, value);
     }
 
+    let upstreamReferer = validatedTarget;
+    const hostLower = targetParsed.hostname.toLowerCase();
+    if (
+      hostLower.endsWith(".redd.it") ||
+      hostLower.endsWith(".redditmedia.com") ||
+      hostLower === "redd.it"
+    ) {
+      upstreamReferer = "https://www.reddit.com/";
+    } else if (
+      hostLower.endsWith(".discordapp.com") ||
+      hostLower.endsWith(".discord.gg") ||
+      hostLower.endsWith(".discord.com")
+    ) {
+      upstreamReferer = "https://discord.com/";
+    }
+
     forwardHeaders.set("Host", targetParsed.host);
     forwardHeaders.set("Origin", targetParsed.origin);
-    forwardHeaders.set("Referer", validatedTarget);
+    forwardHeaders.set("Referer", upstreamReferer);
 
     if (!forwardHeaders.has("User-Agent")) {
       forwardHeaders.set(
@@ -373,22 +389,41 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
   }
 }
 
+function decodeHtmlEntities(str: string): string {
+  if (!str) return str;
+  return str
+    .replace(/&amp;/g, "&")
+    .replace(/&#38;/g, "&")
+    .replace(/&#x26;/gi, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#34;/g, '"')
+    .replace(/&#x22;/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&#60;/g, "<")
+    .replace(/&#x3c;/gi, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#62;/g, ">")
+    .replace(/&#x3e;/gi, ">");
+}
+
 function resolveProxiedUrl(relativeOrAbsolute: string, baseUrl: string): string {
   if (!relativeOrAbsolute) return relativeOrAbsolute;
-  const trimmed = relativeOrAbsolute.trim();
+  const decoded = decodeHtmlEntities(relativeOrAbsolute.trim());
   if (
-    trimmed.startsWith("javascript:") ||
-    trimmed.startsWith("mailto:") ||
-    trimmed.startsWith("tel:") ||
-    trimmed.startsWith("data:") ||
-    trimmed.startsWith("#") ||
-    trimmed.startsWith("/service?url=") ||
-    trimmed.startsWith("/proxy?url=")
+    decoded.startsWith("javascript:") ||
+    decoded.startsWith("mailto:") ||
+    decoded.startsWith("tel:") ||
+    decoded.startsWith("data:") ||
+    decoded.startsWith("#") ||
+    decoded.startsWith("/service?url=") ||
+    decoded.startsWith("/proxy?url=")
   ) {
-    return relativeOrAbsolute;
+    return decoded;
   }
   try {
-    const resolved = new URL(trimmed, baseUrl).toString();
+    const resolved = new URL(decoded, baseUrl).toString();
     return `/service?url=${encodeURIComponent(resolved)}`;
   } catch {
     return relativeOrAbsolute;
@@ -411,23 +446,30 @@ function rewriteSrcset(srcset: string, baseUrl: string): string {
 function rewriteCss(cssText: string, baseUrl: string): string {
   return cssText
     .replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (match, quote, url) => {
+      const cleanUrl = decodeHtmlEntities(url || "").trim();
       if (
-        !url ||
-        url.startsWith("data:") ||
-        url.startsWith("#") ||
-        url.startsWith("/service?url=") ||
-        url.startsWith("/proxy?url=")
+        !cleanUrl ||
+        cleanUrl.startsWith("data:") ||
+        cleanUrl.startsWith("#") ||
+        cleanUrl.startsWith("/service?url=") ||
+        cleanUrl.startsWith("/proxy?url=")
       ) {
         return match;
       }
-      const proxied = resolveProxiedUrl(url, baseUrl);
+      const proxied = resolveProxiedUrl(cleanUrl, baseUrl);
       return `url("${proxied}")`;
     })
     .replace(/@import\s+(['"])(.*?)\1/gi, (match, quote, url) => {
-      if (!url || url.startsWith("data:") || url.startsWith("/service?url=") || url.startsWith("/proxy?url=")) {
+      const cleanUrl = decodeHtmlEntities(url || "").trim();
+      if (
+        !cleanUrl ||
+        cleanUrl.startsWith("data:") ||
+        cleanUrl.startsWith("/service?url=") ||
+        cleanUrl.startsWith("/proxy?url=")
+      ) {
         return match;
       }
-      const proxied = resolveProxiedUrl(url, baseUrl);
+      const proxied = resolveProxiedUrl(cleanUrl, baseUrl);
       return `@import "${proxied}"`;
     });
 }
@@ -437,6 +479,12 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
 (function() {
   const currentTarget = ${JSON.stringify(targetUrl)};
   const endpoint = '/service?url=';
+  let virtualUrl;
+  try {
+    virtualUrl = new URL(currentTarget);
+  } catch (e) {
+    virtualUrl = new URL(window.location.href);
+  }
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register = function() {
@@ -447,51 +495,156 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
   function toRouted(rawUrl) {
     if (!rawUrl) return rawUrl;
     const str = String(rawUrl).trim();
-    if (str.startsWith('javascript:') || str.startsWith('mailto:') || str.startsWith('tel:') || str.startsWith('data:') || str.startsWith('#') || str.startsWith('/service?url=') || str.startsWith('/proxy?url=')) {
+    if (
+      str.startsWith('javascript:') ||
+      str.startsWith('mailto:') ||
+      str.startsWith('tel:') ||
+      str.startsWith('data:') ||
+      str.startsWith('#') ||
+      str.startsWith('/service?url=') ||
+      str.startsWith('/proxy?url=')
+    ) {
       return str;
     }
     try {
-      const resolved = new URL(str, currentTarget).href;
+      const resolved = new URL(str, virtualUrl ? virtualUrl.href : currentTarget).href;
       return endpoint + encodeURIComponent(resolved);
     } catch (e) {
       return str;
     }
   }
 
+  // Location prototype hooks for SPA routing (Discord, Reddit, Next.js, React Router)
+  try {
+    const locProto = Location.prototype;
+    const props = ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'];
+    props.forEach(function(prop) {
+      try {
+        Object.defineProperty(locProto, prop, {
+          get: function() {
+            return virtualUrl[prop];
+          },
+          set: function(val) {
+            if (prop === 'href') {
+              try {
+                const resolved = new URL(val, virtualUrl.href).href;
+                virtualUrl = new URL(resolved);
+                window.location.href = endpoint + encodeURIComponent(resolved);
+              } catch (e) {
+                window.location.href = endpoint + encodeURIComponent(val);
+              }
+            } else if (prop === 'pathname') {
+              try {
+                virtualUrl.pathname = val;
+                window.location.href = endpoint + encodeURIComponent(virtualUrl.href);
+              } catch (e) {}
+            } else if (prop === 'search') {
+              try {
+                virtualUrl.search = val;
+                window.location.href = endpoint + encodeURIComponent(virtualUrl.href);
+              } catch (e) {}
+            } else if (prop === 'hash') {
+              virtualUrl.hash = val;
+            }
+          },
+          configurable: true,
+          enumerable: true,
+        });
+      } catch (e) {}
+    });
+  } catch (e) {}
+
   function notifyParent(urlOverride) {
     try {
       if (window.parent && window.parent !== window) {
         window.parent.postMessage({
           type: 'client_navigated',
-          url: urlOverride || currentTarget,
-          title: document.title || currentTarget
+          url: urlOverride || (virtualUrl ? virtualUrl.href : currentTarget),
+          title: document.title || currentTarget,
         }, '*');
       }
-    } catch(e) {}
+    } catch (e) {}
   }
 
   function rewriteNode(node) {
     if (!node || node.nodeType !== 1) return;
-    if (node.tagName === 'A') {
+    const tag = node.tagName;
+    if (tag === 'A') {
       const h = node.getAttribute('href');
-      if (h && !h.startsWith('#') && !h.startsWith('javascript:') && !h.startsWith('/service?url=')) {
+      if (h && !h.startsWith('#') && !h.startsWith('javascript:') && !h.startsWith('/service?url=') && !h.startsWith('/proxy?url=')) {
         try {
-          const res = new URL(h, currentTarget).href;
+          const res = new URL(h, virtualUrl ? virtualUrl.href : currentTarget).href;
           node.setAttribute('href', endpoint + encodeURIComponent(res));
           if (node.getAttribute('target') === '_top' || node.getAttribute('target') === '_parent') {
             node.setAttribute('target', '_self');
           }
-        } catch(e) {}
+        } catch (e) {}
       }
-    } else if (node.tagName === 'FORM') {
+    } else if (tag === 'FORM') {
       const a = node.getAttribute('action');
-      if (a && !a.startsWith('/service?url=')) {
+      if (a && !a.startsWith('/service?url=') && !a.startsWith('/proxy?url=')) {
         try {
-          const res = new URL(a, currentTarget).href;
+          const res = new URL(a, virtualUrl ? virtualUrl.href : currentTarget).href;
           node.setAttribute('action', endpoint + encodeURIComponent(res));
-        } catch(e) {}
+        } catch (e) {}
+      }
+    } else if (['IMG', 'SCRIPT', 'IFRAME', 'SOURCE', 'VIDEO', 'AUDIO', 'FACEPLATE-IMG', 'FACEPLATE-IMAGE'].indexOf(tag) !== -1) {
+      const src = node.getAttribute('src');
+      if (src && !src.startsWith('data:') && !src.startsWith('/service?url=') && !src.startsWith('/proxy?url=')) {
+        try {
+          const res = new URL(src, virtualUrl ? virtualUrl.href : currentTarget).href;
+          node.setAttribute('src', endpoint + encodeURIComponent(res));
+        } catch (e) {}
+      }
+      const dataSrc = node.getAttribute('data-src');
+      if (dataSrc && !dataSrc.startsWith('data:') && !dataSrc.startsWith('/service?url=') && !dataSrc.startsWith('/proxy?url=')) {
+        try {
+          const res = new URL(dataSrc, virtualUrl ? virtualUrl.href : currentTarget).href;
+          node.setAttribute('data-src', endpoint + encodeURIComponent(res));
+        } catch (e) {}
+      }
+    } else if (tag === 'LINK') {
+      const href = node.getAttribute('href');
+      if (href && !href.startsWith('data:') && !href.startsWith('/service?url=') && !href.startsWith('/proxy?url=')) {
+        try {
+          const res = new URL(href, virtualUrl ? virtualUrl.href : currentTarget).href;
+          node.setAttribute('href', endpoint + encodeURIComponent(res));
+        } catch (e) {}
       }
     }
+  }
+
+  // Intercept DOM Image src setter
+  try {
+    const origImgDescriptor = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+    if (origImgDescriptor && origImgDescriptor.set) {
+      Object.defineProperty(HTMLImageElement.prototype, 'src', {
+        get: function() {
+          return origImgDescriptor.get.call(this);
+        },
+        set: function(val) {
+          origImgDescriptor.set.call(this, toRouted(val));
+        },
+        configurable: true,
+        enumerable: true,
+      });
+    }
+  } catch (e) {}
+
+  // Wrap Worker & SharedWorker
+  if (window.Worker) {
+    const OrigWorker = window.Worker;
+    window.Worker = function(scriptURL, options) {
+      return new OrigWorker(toRouted(scriptURL), options);
+    };
+    window.Worker.prototype = OrigWorker.prototype;
+  }
+  if (window.SharedWorker) {
+    const OrigSharedWorker = window.SharedWorker;
+    window.SharedWorker = function(scriptURL, options) {
+      return new OrigSharedWorker(toRouted(scriptURL), options);
+    };
+    window.SharedWorker.prototype = OrigSharedWorker.prototype;
   }
 
   try {
@@ -502,7 +655,7 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
           const n = added[j];
           if (n.nodeType === 1) {
             rewriteNode(n);
-            const children = n.querySelectorAll ? n.querySelectorAll('a, form') : [];
+            const children = n.querySelectorAll ? n.querySelectorAll('a, form, img, script, link, iframe, faceplate-img') : [];
             for (let k = 0; k < children.length; k++) {
               rewriteNode(children[k]);
             }
@@ -511,7 +664,7 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
       }
     });
     observer.observe(document.documentElement || document, { childList: true, subtree: true });
-  } catch(e) {}
+  } catch (e) {}
 
   window.addEventListener('click', function(e) {
     let el = e.target;
@@ -532,7 +685,7 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
         const match = href.match(/[?&]url=([^&]+)/);
         resolved = match ? decodeURIComponent(match[1]) : href;
       } else {
-        resolved = new URL(href, currentTarget).href;
+        resolved = new URL(href, virtualUrl ? virtualUrl.href : currentTarget).href;
       }
 
       const targetAttr = el.getAttribute('target');
@@ -541,7 +694,7 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
       } else {
         window.location.href = endpoint + encodeURIComponent(resolved);
       }
-    } catch(err) {
+    } catch (err) {
       window.location.href = el.href;
     }
   }, true);
@@ -551,21 +704,21 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     if (!form || form.tagName !== 'FORM') return;
     try {
       const action = form.getAttribute('action') || '';
-      form.action = endpoint + encodeURIComponent(new URL(action, currentTarget).href);
-    } catch(err) {}
+      form.action = endpoint + encodeURIComponent(new URL(action, virtualUrl ? virtualUrl.href : currentTarget).href);
+    } catch (err) {}
   }, true);
 
   const origOpen = window.open;
   window.open = function(url, target, features) {
     if (!url) return null;
     try {
-      const resolved = new URL(url, currentTarget).href;
+      const resolved = new URL(url, virtualUrl ? virtualUrl.href : currentTarget).href;
       if (window.parent && window.parent !== window) {
         window.parent.postMessage({ type: 'client_open_tab', url: resolved }, '*');
         return null;
       }
       return origOpen.call(window, endpoint + encodeURIComponent(resolved), target, features);
-    } catch(e) {
+    } catch (e) {
       return origOpen.apply(window, arguments);
     }
   };
@@ -575,9 +728,9 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     if (origAssign) {
       window.location.assign = function(url) {
         try {
-          const resolved = new URL(url, currentTarget).href;
+          const resolved = new URL(url, virtualUrl ? virtualUrl.href : currentTarget).href;
           window.location.href = endpoint + encodeURIComponent(resolved);
-        } catch(e) {
+        } catch (e) {
           origAssign.call(window.location, url);
         }
       };
@@ -586,22 +739,23 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     if (origReplace) {
       window.location.replace = function(url) {
         try {
-          const resolved = new URL(url, currentTarget).href;
+          const resolved = new URL(url, virtualUrl ? virtualUrl.href : currentTarget).href;
           window.location.href = endpoint + encodeURIComponent(resolved);
-        } catch(e) {
+        } catch (e) {
           origReplace.call(window.location, url);
         }
       };
     }
-  } catch(e) {}
+  } catch (e) {}
 
   const origPushState = history.pushState;
   history.pushState = function(state, unused, url) {
     if (url) {
       try {
-        const resolved = new URL(url, currentTarget).href;
+        const resolved = new URL(url, virtualUrl ? virtualUrl.href : currentTarget).href;
+        virtualUrl = new URL(resolved);
         notifyParent(resolved);
-      } catch(e) {}
+      } catch (e) {}
     }
     return origPushState.apply(this, arguments);
   };
@@ -610,9 +764,10 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
   history.replaceState = function(state, unused, url) {
     if (url) {
       try {
-        const resolved = new URL(url, currentTarget).href;
+        const resolved = new URL(url, virtualUrl ? virtualUrl.href : currentTarget).href;
+        virtualUrl = new URL(resolved);
         notifyParent(resolved);
-      } catch(e) {}
+      } catch (e) {}
     }
     return origReplaceState.apply(this, arguments);
   };
@@ -625,7 +780,7 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
       } else if (input && typeof input === 'object' && 'url' in input) {
         input = toRouted(input.url);
       }
-    } catch(e) {}
+    } catch (e) {}
     return origFetch.call(this, input, init);
   };
 
@@ -633,7 +788,7 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
   XMLHttpRequest.prototype.open = function(method, url, ...rest) {
     try {
       url = toRouted(url);
-    } catch(e) {}
+    } catch (e) {}
     return origXhrOpen.call(this, method, url, ...rest);
   };
 
@@ -745,6 +900,30 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
         if (src) {
           element.setAttribute("src", resolveProxiedUrl(src, targetUrl));
         }
+      },
+    })
+    .on("faceplate-img, faceplate-image, shreddit-player, reddit-player, gallery-carousel", {
+      element(element) {
+        const src = element.getAttribute("src");
+        if (src) element.setAttribute("src", resolveProxiedUrl(src, targetUrl));
+        const srcset = element.getAttribute("srcset");
+        if (srcset) element.setAttribute("srcset", rewriteSrcset(srcset, targetUrl));
+        const poster = element.getAttribute("poster");
+        if (poster) element.setAttribute("poster", resolveProxiedUrl(poster, targetUrl));
+        const dataSrc = element.getAttribute("data-src");
+        if (dataSrc) element.setAttribute("data-src", resolveProxiedUrl(dataSrc, targetUrl));
+      },
+    })
+    .on("[data-src], [data-lazy-src], [data-href], [data-url]", {
+      element(element) {
+        const dataSrc = element.getAttribute("data-src");
+        if (dataSrc) element.setAttribute("data-src", resolveProxiedUrl(dataSrc, targetUrl));
+        const lazySrc = element.getAttribute("data-lazy-src");
+        if (lazySrc) element.setAttribute("data-lazy-src", resolveProxiedUrl(lazySrc, targetUrl));
+        const dataHref = element.getAttribute("data-href");
+        if (dataHref) element.setAttribute("data-href", resolveProxiedUrl(dataHref, targetUrl));
+        const dataUrl = element.getAttribute("data-url");
+        if (dataUrl) element.setAttribute("data-url", resolveProxiedUrl(dataUrl, targetUrl));
       },
     });
 
@@ -1987,6 +2166,7 @@ export {
   accessDeniedResponse,
   serializeCookie,
   resolveProxiedUrl,
+  decodeHtmlEntities,
   rewriteCss,
   rewriteSrcset,
   extractTargetFromPath,

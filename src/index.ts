@@ -309,6 +309,16 @@ async function fetchUpstream(request: Request, rawTarget: string, env: Env): Pro
       forwardHeaders.set("Accept-Language", "en-US,en;q=0.9");
     }
 
+    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      const wsHeaders = new Headers(request.headers);
+      wsHeaders.set("Host", targetParsed.host);
+      wsHeaders.set("Origin", targetParsed.origin);
+      wsHeaders.set("Referer", validatedTarget);
+      return fetch(validatedTarget.replace(/^http(s?):/i, "ws$1:"), {
+        headers: wsHeaders,
+      });
+    }
+
     const hasBody = !["GET", "HEAD"].includes(request.method.toUpperCase()) && request.body !== null;
 
     const upstreamResponse = await fetch(validatedTarget, {
@@ -486,6 +496,25 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     virtualUrl = new URL(window.location.href);
   }
 
+  function decodeEntities(str) {
+    if (!str) return str;
+    return String(str)
+      .replace(/&amp;/g, '&')
+      .replace(/&#38;/g, '&')
+      .replace(/&#x26;/gi, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#34;/g, '"')
+      .replace(/&#x22;/gi, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&#x27;/gi, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&#60;/g, '<')
+      .replace(/&#x3c;/gi, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&#62;/g, '>')
+      .replace(/&#x3e;/gi, '>');
+  }
+
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register = function() {
       return Promise.reject(new Error('ServiceWorker disabled'));
@@ -494,7 +523,7 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
 
   function toRouted(rawUrl) {
     if (!rawUrl) return rawUrl;
-    const str = String(rawUrl).trim();
+    const str = decodeEntities(rawUrl).trim();
     if (
       str.startsWith('javascript:') ||
       str.startsWith('mailto:') ||
@@ -514,7 +543,44 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     }
   }
 
-  // Location prototype hooks for SPA routing (Discord, Reddit, Next.js, React Router)
+  // Intercept Discord GLOBAL_ENV configuration
+  try {
+    let globalEnvStore;
+    Object.defineProperty(window, 'GLOBAL_ENV', {
+      get: function() {
+        return globalEnvStore;
+      },
+      set: function(val) {
+        if (val && typeof val === 'object') {
+          try {
+            if (val.API_ENDPOINT && typeof val.API_ENDPOINT === 'string') {
+              val.API_ENDPOINT = endpoint + encodeURIComponent(new URL(val.API_ENDPOINT, currentTarget).href);
+            }
+            if (val.ASSET_ENDPOINT && typeof val.ASSET_ENDPOINT === 'string') {
+              val.ASSET_ENDPOINT = endpoint + encodeURIComponent(new URL(val.ASSET_ENDPOINT, currentTarget).href);
+            }
+            if (val.DEVELOPERS_ENDPOINT && typeof val.DEVELOPERS_ENDPOINT === 'string') {
+              val.DEVELOPERS_ENDPOINT = endpoint + encodeURIComponent(new URL(val.DEVELOPERS_ENDPOINT, currentTarget).href);
+            }
+            if (val.MARKETING_ENDPOINT && typeof val.MARKETING_ENDPOINT === 'string') {
+              val.MARKETING_ENDPOINT = endpoint + encodeURIComponent(new URL(val.MARKETING_ENDPOINT, currentTarget).href);
+            }
+            if (val.WEBAPP_ENDPOINT && typeof val.WEBAPP_ENDPOINT === 'string') {
+              val.WEBAPP_ENDPOINT = endpoint + encodeURIComponent(new URL(val.WEBAPP_ENDPOINT, currentTarget).href);
+            }
+            if (val.WIDGET_ENDPOINT && typeof val.WIDGET_ENDPOINT === 'string') {
+              val.WIDGET_ENDPOINT = endpoint + encodeURIComponent(new URL(val.WIDGET_ENDPOINT, currentTarget).href);
+            }
+          } catch(e) {}
+        }
+        globalEnvStore = val;
+      },
+      configurable: true,
+      enumerable: true
+    });
+  } catch(e) {}
+
+  // Location prototype hooks for SPA routing
   try {
     const locProto = Location.prototype;
     const props = ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'];
@@ -614,6 +680,37 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     }
   }
 
+  // Intercept Element.prototype.setAttribute for React / DOM frameworks
+  try {
+    const origSetAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function(name, value) {
+      if (typeof value === 'string' && value) {
+        const lower = name.toLowerCase();
+        if (
+          lower === 'src' ||
+          lower === 'data-src' ||
+          lower === 'data-lazy-src' ||
+          lower === 'poster' ||
+          lower === 'background' ||
+          lower === 'data-url'
+        ) {
+          value = toRouted(value);
+        } else if (lower === 'href' && !value.startsWith('#') && !value.startsWith('javascript:') && !value.startsWith('mailto:')) {
+          value = toRouted(value);
+        } else if (lower === 'action') {
+          value = toRouted(value);
+        } else if (lower === 'srcset' || lower === 'data-srcset') {
+          value = value.split(',').map(function(s) {
+            const parts = s.trim().split(/\s+/);
+            if (parts[0]) parts[0] = toRouted(parts[0]);
+            return parts.join(' ');
+          }).join(', ');
+        }
+      }
+      return origSetAttribute.call(this, name, value);
+    };
+  } catch(e) {}
+
   // Intercept DOM Image src setter
   try {
     const origImgDescriptor = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
@@ -645,6 +742,43 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
       return new OrigSharedWorker(toRouted(scriptURL), options);
     };
     window.SharedWorker.prototype = OrigSharedWorker.prototype;
+  }
+
+  // Wrap WebSocket
+  if (window.WebSocket) {
+    const OrigWebSocket = window.WebSocket;
+    window.WebSocket = function(url, protocols) {
+      try {
+        if (typeof url === 'string') {
+          const str = url.trim();
+          if (str.startsWith('wss://') || str.startsWith('ws://')) {
+            const locProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const proxyWsUrl = locProto + '//' + window.location.host + endpoint + encodeURIComponent(str.replace(/^ws(s?):/i, 'http$1:'));
+            return protocols !== undefined ? new OrigWebSocket(proxyWsUrl, protocols) : new OrigWebSocket(proxyWsUrl);
+          }
+        }
+      } catch(e) {}
+      return protocols !== undefined ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
+    };
+    window.WebSocket.prototype = OrigWebSocket.prototype;
+  }
+
+  // Wrap Beacon & EventSource
+  if (navigator.sendBeacon) {
+    const origBeacon = navigator.sendBeacon;
+    navigator.sendBeacon = function(url, data) {
+      try {
+        url = toRouted(url);
+      } catch(e) {}
+      return origBeacon.call(navigator, url, data);
+    };
+  }
+  if (window.EventSource) {
+    const OrigEventSource = window.EventSource;
+    window.EventSource = function(url, dict) {
+      return new OrigEventSource(toRouted(url), dict);
+    };
+    window.EventSource.prototype = OrigEventSource.prototype;
   }
 
   try {
@@ -777,8 +911,14 @@ function rewriteHtml(response: Response, targetUrl: string): Response {
     try {
       if (typeof input === 'string') {
         input = toRouted(input);
+      } else if (input instanceof Request) {
+        return origFetch.call(this, new Request(toRouted(input.url), input), init);
       } else if (input && typeof input === 'object' && 'url' in input) {
-        input = toRouted(input.url);
+        try {
+          return origFetch.call(this, new Request(toRouted(input.url), input), init);
+        } catch(e) {
+          input.url = toRouted(input.url);
+        }
       }
     } catch (e) {}
     return origFetch.call(this, input, init);
